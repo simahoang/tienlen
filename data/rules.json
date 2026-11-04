@@ -1,0 +1,177 @@
+{
+  "schemaVersion": 1,
+  "rulesVersion": "1.2.0",
+  "sourceDoc": "doc-2 rev4 (task-12) - ruleset Tiến Lên Miền Nam M1",
+  "deck": {
+    "cardCount": 52,
+    "ranks": ["3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A", "2"],
+    "suits": ["spades", "clubs", "diamonds", "hearts"],
+    "suitSymbols": {
+      "spades": "♠",
+      "clubs": "♣",
+      "diamonds": "♦",
+      "hearts": "♥"
+    },
+    "rankLabels": {
+      "3": "3",
+      "4": "4",
+      "5": "5",
+      "6": "6",
+      "7": "7",
+      "8": "8",
+      "9": "9",
+      "10": "10",
+      "J": "J",
+      "Q": "Q",
+      "K": "K",
+      "A": "A",
+      "2": "2"
+    },
+    "orderNote": "Rank tăng dần 3 < 4 < ... < A < 2; cùng rank so chất ♠ < ♣ < ♦ < ♥ (3♠ yếu nhất, 2♥ mạnh nhất)."
+  },
+  "deal": {
+    "cardsPerPlayer": 13,
+    "playerCounts": [
+      { "players": 4, "cardsPerPlayer": 13, "deadCards": 0 },
+      { "players": 3, "cardsPerPlayer": 13, "deadCards": 13 },
+      { "players": 2, "cardsPerPlayer": 13, "deadCards": 26 }
+    ],
+    "note": "Bài dư úp, loại khỏi ván, không ai xem. Ván 2-3 người đánh giống hệt 4 người (V10)."
+  },
+  "firstPlayer": {
+    "mustContain3S": true,
+    "primaryCard": { "rank": "3", "suit": "spades" },
+    "fallbackSuits": ["clubs", "diamonds", "hearts"],
+    "fallbackRule": "lowestCard",
+    "rejectCode": "FIRST_MUST_CONTAIN_3S",
+    "note": "Người giữ 3♠ đi trước và lượt đầu bắt buộc đánh bộ chứa 3♠. Nếu 3♠ nằm trong bài dư: xét 3♣ → 3♦ → 3♥ → lá thấp nhất; lượt đầu đánh tự do."
+  },
+  "variants": [
+    { "id": "V1", "key": "toiTrang", "status": "enabled", "note": "Bật 5 tổ hợp tới trắng §2.2" },
+    { "id": "V2", "key": "chatHeo", "status": "enabled", "note": "Ma trận chặt §2.1, cho phép chặt chồng" },
+    { "id": "V3", "key": "blackRedSplit", "status": "disabled", "note": "Heo đen/đỏ bình đẳng (decision-6)" },
+    { "id": "V4", "key": "fourPairChop", "status": "enabled", "note": "4 đôi thông chặt tứ quý và đôi heo" },
+    { "id": "V5", "key": "thoiHaiThoiHang", "status": "enabled", "note": "Phạt thối 2 và thối hàng" },
+    { "id": "V6", "key": "haiVeCuoi", "status": "allowedNoPenalty", "note": "2 về cuối được phép, không phạt" },
+    { "id": "V7", "key": "baBichCuoi", "status": "disabled", "note": "3♠ về cuối không thưởng" },
+    { "id": "V8", "key": "denBai", "status": "enabled", "note": "Đền 13 lá + DEN-2 chặt chồng §2.3 (rev 4 bỏ DEN-1/DEN-3)" },
+    { "id": "V9", "key": "sanhChuaHai", "status": "forbidden", "note": "Cấm sảnh chứa 2 và A-2-3" },
+    { "id": "V10", "key": "van2to3Nguoi", "status": "sameAs4", "note": "Ván 2-3 người đánh giống hệt 4 người" }
+  ],
+  "flags": {
+    "toiTrang": true,
+    "chatHeo": true,
+    "blackRedSplit": false,
+    "thoiHai": true,
+    "thoiHang": true,
+    "haiVeCuoi": true,
+    "baBichCuoi": false,
+    "denBai": true,
+    "sanhChuaHai": false,
+    "chatNgoaiLuot": true
+  },
+  "combos": {
+    "rac": { "cards": 1, "description": "Một lá bất kỳ, kể cả 2" },
+    "doi": { "cards": 2, "description": "Hai lá cùng rank, kể cả đôi 2" },
+    "samCo": { "cards": 3, "description": "Ba lá cùng rank" },
+    "sanh": {
+      "minCards": 3,
+      "maxCards": 12,
+      "noTwo": true,
+      "description": "Từ 3 lá rank liên tiếp trở lên, không chứa 2; không có A-2-3"
+    },
+    "tuQuy": { "cards": 4, "description": "Bốn lá cùng rank, vừa là bộ đánh vừa là hàng chặt" },
+    "baDoiThong": { "cards": 6, "description": "Ba đôi rank liên tiếp" },
+    "bonDoiThong": { "cards": 8, "description": "Bốn đôi rank liên tiếp" },
+    "namDoiThong": {
+      "cards": 10,
+      "playable": false,
+      "toiTrangOnly": true,
+      "description": "Năm đôi thông KHÔNG phải bộ đánh, chỉ xét tới trắng (V1)"
+    }
+  },
+  "toiTrang": {
+    "enabled": true,
+    "combos": ["sanh3toA", "namDoiThong", "sauDoiThong", "sauDoiBatKy", "tuQuyHai"],
+    "priority": ["sanh3toA", "sauDoiThong", "sauDoiBatKy", "tuQuyHai", "namDoiThong"],
+    "timing": "sauChiaTruocNuocDau",
+    "tieBreak": "startingOrder",
+    "noSuitSplit": true,
+    "sanh13LaLeDuocLaHai": true,
+    "tuQuyDemHaiDoi": true,
+    "note": "Sảnh 3→A đủ 12 rank + 1 lá bất kỳ (lá lẻ thứ 13 được là 2); 5/6 đôi thông; 6 đôi bất kỳ (tứ quý đếm là 2 đôi); tứ quý 2 + 9 lá bất kỳ. Trùng tổ hợp tính 1 lần mức cao hơn."
+  },
+  "chatHeo": {
+    "enabled": true,
+    "matrix": {
+      "baDoiThong": {
+        "singleTwo": true,
+        "pairTwo": false,
+        "baDoiThong": false,
+        "tuQuy": false,
+        "bonDoiThong": false
+      },
+      "tuQuy": {
+        "singleTwo": true,
+        "pairTwo": true,
+        "baDoiThong": true,
+        "tuQuy": true,
+        "bonDoiThong": false
+      },
+      "bonDoiThong": {
+        "singleTwo": true,
+        "pairTwo": true,
+        "baDoiThong": true,
+        "tuQuy": true,
+        "bonDoiThong": true
+      }
+    },
+    "crossTypeNoRankCompare": true,
+    "unlimitedStacking": true,
+    "orderNote": "3 đôi thông < tứ quý < 4 đôi thông; chặt chéo loại không so rank; cùng loại so rank/đôi cao nhất"
+  },
+  "blackRedSplit": false,
+  "thoiHai": { "enabled": true },
+  "thoiHang": { "enabled": true },
+  "haiVeCuoi": { "allowed": true, "penalty": 0 },
+  "baBichCuoi": { "enabled": false, "bonus": 0 },
+  "denBai": {
+    "enabled": true,
+    "pointsRef": "scoring.den.giu13La",
+    "chatChongGanhChuoi": true,
+    "chatChongTheoGiaTriMucTieu": true,
+    "note": "Đền 13 lá: người còn đủ 13 lá trả Nhất 4 + tổng giá trị heo/hàng trên tay, không tính thối riêng. DEN-2 chặt chồng: revert khoản chặt lẻ, chỉ đền giá trị mục tiêu ĐẦU chuỗi (không cộng dồn). DEN-1/DEN-3 đã bỏ từ rev 4."
+  },
+  "sanhChuaHai": false,
+  "chatNgoaiLuot": {
+    "enabled": true,
+    "windowMs": 3000,
+    "passedCannotChop": true,
+    "pauseTurnTimer": true,
+    "tieBreak": "arrivalThenSeatOrder",
+    "opensOn": ["singleTwo", "pairTwo", "tuQuy", "baDoiThong", "bonDoiThong"],
+    "note": "Mở window sau nước hợp lệ thuộc tập chặt được; đóng theo giờ server, không gia hạn window hiện tại"
+  },
+  "scoring": {
+    "unit": "diemTour",
+    "places": { "nhat": 3, "nhi": 2, "ba": 1, "bet": 0 },
+    "toiTrang": { "points": 6 },
+    "values": {
+      "heoDen": 1,
+      "heoDo": 2,
+      "baDoiThong": 3,
+      "tuQuy": 4,
+      "bonDoiThong": 6
+    },
+    "den": { "giu13La": 4 },
+    "haiVeCuoi": 0,
+    "baBichCuoi": 0,
+    "note": "Hạng cộng dồn từ tour chung: 4 người 3/2/1/0 (tổng 6), 3 người 3/2/0 (tổng 5), 2 người 3/0 (tổng 3); không zero-sum, không dồn lệch. Tới trắng +6. Chặt/thối/đền là chuyển điểm theo bảng values. Bảng cũ 5/6/8/10/12 và 10/nhà đã bỏ."
+  },
+  "turn": {
+    "turnTimerMs": 25000,
+    "countdownWarnMs": 10000,
+    "autoPassWhenMidTrick": true,
+    "autoPlayLowestWhenLeading": true
+  }
+}
