@@ -18,6 +18,9 @@ import type { Card } from '../src/rules/types';
 import type { AuthedSocket, Principal } from './auth/principal';
 import type { GameStore } from './db';
 import {
+  CHAT_HISTORY_MAX,
+  CHAT_RATE_MAX,
+  CHAT_RATE_WINDOW_MS,
   MAX_SEATS,
   MAX_SPECTATORS,
   MIN_SEATS,
@@ -26,9 +29,11 @@ import {
   parseClientMessage,
   type ActionLogView,
   type CardView,
+  type ChatMessageView,
   type ChopWindowView,
   type ClientMessage,
   type DenBaiView,
+  type LeaderboardRowView,
   type PublicGameState,
   type RankingView,
   type RoomPhase,
@@ -181,6 +186,11 @@ export class Room {
   /** Mốc auto chia ván mới / resume (epoch ms). */
   nextRoundAt: number | null = null;
   readonly tourScores = new Map<string, TourScore>();
+  /** Chat phòng: history tối đa CHAT_HISTORY_MAX, cũ nhất ở đầu. */
+  readonly chat: ChatMessageView[] = [];
+  chatSeq = 0;
+  /** Rate limit chat theo account → các mốc thời gian gửi gần đây (epoch ms). */
+  readonly chatRate = new Map<string, number[]>();
   /** Hạng ván trước theo account (ghế có thể đổi khi compact lại). */
   readonly previousPlaces = new Map<string, Place>();
   /** Ghế đi trước + lượt đầu tự do của ván hiện tại (để ghi DB/replay). */
@@ -291,6 +301,9 @@ export class RoomManager {
         return;
       case 'newTour':
         this.newTour(socket, message.soVan);
+        return;
+      case 'chat':
+        this.handleChat(socket, message.text);
         return;
       case 'play':
       case 'pass':
@@ -554,6 +567,7 @@ export class RoomManager {
       this.maybeResumeTour(room);
     }
     this.sendRoom(room, player);
+    this.sendChatHistory(room, player);
     this.broadcastRoom(room);
   }
 
@@ -588,6 +602,7 @@ export class RoomManager {
     this.bindings.set(socket, { room, role: 'spectator', spectator });
     this.cancelCleanup(room);
     this.sendRoom(room, spectator);
+    this.sendChatHistory(room, spectator);
     this.broadcastRoom(room);
     if (room.game) this.sendState(room, spectator, { includeLog: true });
     this.sendTourSnapshot(room, spectator);
@@ -672,6 +687,82 @@ export class RoomManager {
     this.broadcastRoom(binding.room);
     this.maybeScheduleCleanup(binding.room);
     this.sendRoomList(socket);
+  }
+
+  /** Chat phòng: chỉ người chơi gửi, rate limit theo account, broadcast cho cả phòng. */
+  private handleChat(socket: WebSocket, text: string): void {
+    const binding = this.bindingOf(socket);
+    if (!binding) {
+      this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
+      return;
+    }
+    if (binding.role !== 'player') {
+      this.sendError(socket, 'FORBIDDEN_ROLE', 'khán giả chỉ xem chat, không gửi được');
+      return;
+    }
+    const { room, player } = binding;
+    if (player.left) {
+      this.sendError(socket, 'FORBIDDEN_ROLE', 'đã rời tour, không gửi chat được');
+      return;
+    }
+    const now = Date.now();
+    const cutoff = now - CHAT_RATE_WINDOW_MS;
+    const recent = (room.chatRate.get(player.account) ?? []).filter((time) => time > cutoff);
+    if (recent.length >= CHAT_RATE_MAX) {
+      room.chatRate.set(player.account, recent);
+      this.sendError(socket, 'RATE_LIMITED', 'gửi chat quá nhanh, thử lại sau');
+      return;
+    }
+    recent.push(now);
+    room.chatRate.set(player.account, recent);
+    room.chatSeq += 1;
+    const message: ChatMessageView = {
+      id: `c${room.chatSeq}`,
+      seat: player.seat,
+      nickname: player.nickname,
+      role: 'player',
+      text,
+      at: now,
+    };
+    room.chat.push(message);
+    if (room.chat.length > CHAT_HISTORY_MAX) {
+      room.chat.splice(0, room.chat.length - CHAT_HISTORY_MAX);
+    }
+    this.broadcastChat(room, message);
+  }
+
+  private broadcastChat(room: Room, message: ChatMessageView): void {
+    const payload: ServerMessage = { t: 'chat', message };
+    for (const player of room.players) {
+      if (player.socket) this.send(player.socket, payload);
+    }
+    for (const spectator of room.spectators) {
+      if (spectator.socket) this.send(spectator.socket, payload);
+    }
+  }
+
+  /** Gửi history chat (tối đa CHAT_HISTORY_MAX) khi join/reconnect để panel chat có nội dung. */
+  private sendChatHistory(room: Room, viewer: RoomPlayer | RoomSpectator): void {
+    if (!viewer.socket) return;
+    this.send(viewer.socket, { t: 'chatHistory', messages: room.chat.slice() });
+  }
+
+  /** Panel trái: bảng điểm tour live, sort điểm desc → thắng desc → ghế asc. */
+  private leaderboard(room: Room): readonly LeaderboardRowView[] {
+    return [...room.tourScores.values()]
+      .sort((a, b) => {
+        if (b.pointsTotal !== a.pointsTotal) return b.pointsTotal - a.pointsTotal;
+        if (b.wins !== a.wins) return b.wins - a.wins;
+        return this.liveSeatOf(room, a) - this.liveSeatOf(room, b);
+      })
+      .map((entry) => ({
+        seat: this.liveSeatOf(room, entry),
+        nickname: entry.nickname,
+        pointsTotal: entry.pointsTotal,
+        wins: entry.wins,
+        roundsPlayed: entry.roundsPlayed,
+        left: entry.left,
+      }));
   }
 
   private firstFreeSeat(room: Room): number | null {
@@ -1545,9 +1636,20 @@ export class RoomManager {
       this.sendError(socket, 'NO_TOUR', 'phòng chưa mở tour');
       return;
     }
+    // Detach trước để broadcast không còn gửi room cho người đã rời.
+    player.socket = null;
+    this.bindings.delete(socket);
+    if (this.accountSockets.get(player.account) === socket) {
+      this.accountSockets.delete(player.account);
+    }
+    // markLeft đã gọi releaseSeat; gọi lại là no-op nhưng giữ đúng thứ tự cũ.
     this.markLeft(room, player);
     this.releaseSeat(room, player);
+    this.send(socket, { t: 'leftTour' });
+    this.broadcastRoom(room);
     this.maybeScheduleCleanup(room);
+    // Giữ socket để client về sảnh ngay; người khác thấy ghế đã trống / cờ left.
+    this.sendRoomList(socket);
   }
 
   private endTour(socket: WebSocket): void {
@@ -1706,6 +1808,7 @@ export class RoomManager {
       this.clearGrace(room, player.seat);
       this.clearExpiry(room, player.seat);
       this.sendRoom(room, player);
+      this.sendChatHistory(room, player);
       this.broadcastRoom(room);
       if (room.game) {
         // §3.2: reconnect nhận full state + action log công khai; người khác nhận state thường.
@@ -1741,6 +1844,7 @@ export class RoomManager {
     this.accountSockets.set(account, socket);
     this.cancelCleanup(room);
     this.sendRoom(room, spectator);
+    this.sendChatHistory(room, spectator);
     this.broadcastRoom(room);
     if (room.game) this.sendState(room, spectator, { includeLog: true });
     this.sendTourSnapshot(room, spectator);
@@ -2144,7 +2248,9 @@ export class RoomManager {
           isHost: player.seat === room.hostSeat,
         })),
       spectatorCount: this.spectatorCount(room),
-      ...(room.tourId !== null ? { tour: this.tourView(room) } : {}),
+      ...(room.tourId !== null
+        ? { tour: this.tourView(room), leaderboard: this.leaderboard(room) }
+        : {}),
       you: {
         seat: isPlayer ? viewer.seat : -1,
         token: viewer.token,

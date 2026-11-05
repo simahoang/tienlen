@@ -1,12 +1,14 @@
 import { rules } from '../data';
 import type { ConnectionStatus } from '../net/client';
-import type {
-  CardView,
-  DenBaiView,
-  TourEndView,
-  TourPausedView,
-  TourPhase,
-  TourResultView,
+import {
+  CHAT_MAX,
+  type CardView,
+  type ChatMessageView,
+  type DenBaiView,
+  type TourEndView,
+  type TourPausedView,
+  type TourPhase,
+  type TourResultView,
 } from '../net/protocol';
 import { activateDialog } from '../ui/dom';
 import { formatConnectionStatus } from '../ui/errors';
@@ -64,7 +66,15 @@ export interface TableActions {
   leaveTour(): void;
   endTour(): void;
   newTour(soVan: number): void;
+  /** Gửi nội dung chat đang soạn (đã trim; rỗng thì bỏ qua). */
+  sendChat(): void;
+  onChatDraftChange(value: string): void;
+  /** Mobile: mở/đóng panel trái hoặc phải; chỉ một panel mở cùng lúc. */
+  togglePanel(panel: 'leaderboard' | 'chat'): void;
+  closePanel(): void;
 }
+
+export type SidePanelKind = 'leaderboard' | 'chat';
 
 export interface TableRenderState {
   readonly view: TableViewModel;
@@ -82,6 +92,12 @@ export interface TableRenderState {
   readonly chop: ChopView | null;
   readonly breakdown: readonly BreakdownEntry[] | null;
   readonly tour: TableTourRenderState;
+  /** Lịch sử + tin chat live của phòng. */
+  readonly chatMessages: readonly ChatMessageView[];
+  /** Nội dung đang soạn trong ô chat (giữ qua các lần render). */
+  readonly chatDraft: string;
+  /** Panel đang mở trên mobile; null = đóng cả hai. Desktop luôn hiện cả hai. */
+  readonly openPanel: SidePanelKind | null;
 }
 
 function element<K extends keyof HTMLElementTagNameMap>(
@@ -410,6 +426,207 @@ function resultOverlay(state: TableRenderState, actions: TableActions): HTMLElem
   return overlay;
 }
 
+/** Nút đóng panel trên mobile (desktop ẩn). */
+function panelCloseButton(testId: string, label: string, actions: TableActions): HTMLButtonElement {
+  const close = text('button', 'Đóng', 'btn btn--tiny side-panel__close');
+  close.type = 'button';
+  close.dataset['testid'] = testId;
+  close.setAttribute('aria-label', label);
+  close.addEventListener('click', () => {
+    actions.closePanel();
+  });
+  return close;
+}
+
+function panelShell(
+  kind: SidePanelKind,
+  title: string,
+  open: boolean,
+  actions: TableActions,
+): { panel: HTMLElement; body: HTMLElement } {
+  const panel = element(
+    'aside',
+    `side-panel side-panel--${kind}${open ? ' side-panel--open' : ''}`,
+  );
+  panel.id = `${kind}-panel`;
+  panel.dataset['testid'] = kind === 'chat' ? 'chat-panel' : 'leaderboard-panel';
+  panel.setAttribute('aria-label', title);
+
+  const head = element('div', 'side-panel__head');
+  head.append(text('h2', title, 'side-panel__title'));
+  head.append(
+    panelCloseButton(
+      kind === 'chat' ? 'close-chat' : 'close-leaderboard',
+      `Đóng ${title.toLowerCase()}`,
+      actions,
+    ),
+  );
+  const body = element('div', 'side-panel__body');
+  panel.append(head, body);
+  return { panel, body };
+}
+
+function leaderboardRow(
+  seat: number,
+  rank: number,
+  nickname: string,
+  meta: string,
+  isYou: boolean,
+  left: boolean,
+  points: number | null,
+): HTMLLIElement {
+  const row = element(
+    'li',
+    `lb-row${isYou ? ' lb-row--you' : ''}${left ? ' lb-row--left' : ''}`,
+  );
+  row.dataset['testid'] = `leaderboard-row-${seat}`;
+  row.dataset['rank'] = String(rank);
+  if (left) row.dataset['left'] = 'true';
+  if (isYou) row.dataset['you'] = 'true';
+
+  const rankNode = text('span', `#${rank}`, 'lb-row__rank');
+  const main = element('div', 'lb-row__main');
+  const nameRow = element('span', 'lb-row__name-row');
+  nameRow.append(text('span', isYou ? `${nickname} (bạn)` : nickname, 'lb-row__name'));
+  if (left) nameRow.append(text('span', 'Đã rời', 'badge badge--off lb-row__left'));
+  const metaNode = text('span', meta, 'lb-row__meta');
+  main.append(nameRow, metaNode);
+  row.append(rankNode, main);
+  if (points !== null) {
+    const pointsNode = text('span', String(points), 'lb-row__points');
+    pointsNode.dataset['testid'] = `leaderboard-points-${seat}`;
+    row.append(pointsNode);
+  }
+  return row;
+}
+
+function leaderboardPanel(state: TableRenderState, actions: TableActions): HTMLElement {
+  const { view } = state;
+  const { panel, body } = panelShell(
+    'leaderboard',
+    'Bảng xếp hạng',
+    state.openPanel === 'leaderboard',
+    actions,
+  );
+  const list = element('ol', 'lb-list');
+  const tourRows = view.leaderboard;
+  if (tourRows.length > 0) {
+    tourRows.forEach((row, index) => {
+      list.append(
+        leaderboardRow(
+          row.seat,
+          index + 1,
+          row.nickname,
+          `${row.wins} thắng · ${row.roundsPlayed} ván`,
+          row.seat === view.youSeat && !view.isSpectator,
+          row.left,
+          row.pointsTotal,
+        ),
+      );
+    });
+  } else {
+    // Phòng không mở tour: xếp tạm theo số lá còn lại (ít lá = gần về nhất).
+    const fallback = view.seats
+      .filter((seat) => seat.nickname !== null)
+      .slice()
+      .sort((a, b) => a.cardsLeft - b.cardsLeft || a.seat - b.seat);
+    fallback.forEach((seat, index) => {
+      list.append(
+        leaderboardRow(
+          seat.seat,
+          index + 1,
+          seat.nickname ?? '',
+          `${seat.cardsLeft} lá`,
+          seat.isYou,
+          seat.surrendered,
+          null,
+        ),
+      );
+    });
+    if (fallback.length === 0) {
+      body.append(text('p', 'Chưa có người chơi.', 'side-panel__empty'));
+      return panel;
+    }
+  }
+  body.append(list);
+  return panel;
+}
+
+function chatMessageItem(message: ChatMessageView, youSeat: number): HTMLLIElement {
+  const mine = message.seat === youSeat && youSeat >= 0;
+  const item = element('li', `chat-msg${mine ? ' chat-msg--you' : ''}`);
+  item.dataset['testid'] = `chat-message-${message.id}`;
+  item.dataset['seat'] = String(message.seat);
+  const meta = element('div', 'chat-msg__meta');
+  meta.append(text('span', message.nickname, 'chat-msg__name'));
+  if (message.role === 'spectator') {
+    const badge = text('span', 'Khán giả', 'badge badge--muted chat-msg__role');
+    badge.dataset['testid'] = 'chat-role-spectator';
+    meta.append(badge);
+  }
+  const time = new Date(message.at);
+  const stamp = `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
+  meta.append(text('span', stamp, 'chat-msg__time'));
+  item.append(meta, text('p', message.text, 'chat-msg__text'));
+  return item;
+}
+
+function chatPanel(state: TableRenderState, actions: TableActions): HTMLElement {
+  const { view } = state;
+  const { panel, body } = panelShell('chat', 'Chat', state.openPanel === 'chat', actions);
+  const online = state.status === 'open';
+
+  const list = element('ul', 'chat-messages');
+  list.dataset['testid'] = 'chat-messages';
+  list.setAttribute('role', 'log');
+  list.setAttribute('aria-live', 'polite');
+  list.setAttribute('aria-label', 'Tin nhắn trong phòng');
+  for (const message of state.chatMessages) {
+    list.append(chatMessageItem(message, view.youSeat));
+  }
+  if (state.chatMessages.length === 0) {
+    const empty = text('p', 'Chưa có tin nhắn nào.', 'chat-empty');
+    empty.dataset['testid'] = 'chat-empty';
+    list.append(empty);
+  }
+  body.append(list);
+
+  if (view.isSpectator) {
+    const hint = text('p', 'Khán giả chỉ xem chat', 'chat-readonly');
+    hint.dataset['testid'] = 'chat-readonly';
+    body.append(hint);
+  }
+
+  const compose = element('div', 'chat-compose');
+  const input = element('textarea', 'chat-input');
+  input.dataset['testid'] = 'chat-input';
+  input.rows = 1;
+  input.maxLength = CHAT_MAX;
+  input.value = state.chatDraft;
+  input.placeholder = view.isSpectator ? 'Khán giả chỉ xem chat' : 'Nhập tin nhắn…';
+  input.disabled = view.isSpectator || !online;
+  input.setAttribute('aria-label', 'Nội dung tin nhắn');
+  input.addEventListener('input', () => {
+    actions.onChatDraftChange(input.value);
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || event.shiftKey) return;
+    event.preventDefault();
+    actions.sendChat();
+  });
+
+  const send = text('button', 'Gửi', 'btn btn--primary btn--tiny chat-send');
+  send.type = 'button';
+  send.dataset['testid'] = 'chat-send';
+  send.disabled = view.isSpectator || !online || state.chatDraft.trim().length === 0;
+  send.addEventListener('click', () => {
+    actions.sendChat();
+  });
+  compose.append(input, send);
+  body.append(compose);
+  return panel;
+}
+
 export function renderTable(
   mount: HTMLElement,
   state: TableRenderState,
@@ -428,6 +645,30 @@ export function renderTable(
   headInfo.append(text('p', 'Phòng', 'eyebrow'), code);
 
   const headRight = element('div', 'table-head__right');
+
+  // Toggle panel chỉ hiện trên mobile (CSS ẩn ở desktop >=1100px).
+  const toggles = element('div', 'table-head__toggles');
+  const lbToggle = text('button', 'BXH', 'btn btn--tiny panel-toggle');
+  lbToggle.type = 'button';
+  lbToggle.dataset['testid'] = 'toggle-leaderboard';
+  lbToggle.setAttribute('aria-expanded', String(state.openPanel === 'leaderboard'));
+  lbToggle.setAttribute('aria-controls', 'leaderboard-panel');
+  lbToggle.setAttribute('aria-label', 'Bảng xếp hạng');
+  lbToggle.addEventListener('click', () => {
+    actions.togglePanel('leaderboard');
+  });
+  const chatToggle = text('button', 'Chat', 'btn btn--tiny panel-toggle');
+  chatToggle.type = 'button';
+  chatToggle.dataset['testid'] = 'toggle-chat';
+  chatToggle.setAttribute('aria-expanded', String(state.openPanel === 'chat'));
+  chatToggle.setAttribute('aria-controls', 'chat-panel');
+  chatToggle.setAttribute('aria-label', 'Chat phòng');
+  chatToggle.addEventListener('click', () => {
+    actions.togglePanel('chat');
+  });
+  toggles.append(lbToggle, chatToggle);
+  headRight.append(toggles);
+
   const phase = text('span', view.phaseLabel, 'pill');
   phase.dataset['testid'] = 'phase';
   headRight.append(phase);
@@ -451,6 +692,7 @@ export function renderTable(
   });
   headRight.append(mute);
   head.append(headInfo, headRight);
+  screen.append(head);
 
   const connection = connectionBanner(state.status, state.reconnectAttempt);
   if (connection !== null) screen.append(connection);
@@ -485,6 +727,12 @@ export function renderTable(
     banner.append(bannerActions);
     screen.append(banner);
   }
+
+  // 3 cột desktop: BXH | bàn bài | chat. Mobile: 1 cột + drawer (xem styles.css).
+  const layout = element('div', 'table-layout');
+  const main = element('div', 'table-main');
+  layout.append(leaderboardPanel(state, actions), main, chatPanel(state, actions));
+  screen.append(layout);
 
   const names = new Map<number, string>();
   for (const seat of view.seats) {
@@ -580,21 +828,21 @@ export function renderTable(
     board.append(text('p', 'Chưa có nước đánh.', 'board__placeholder'));
   }
 
-  screen.append(head, seats);
+  main.append(seats);
 
   const denEvent = state.tour.denBai;
   if (denEvent !== null && view.seats.some((seat) => seat.denOut)) {
-    screen.append(renderDenBannerFor(denEvent, names));
+    main.append(renderDenBannerFor(denEvent, names));
   }
 
-  screen.append(board);
+  main.append(board);
 
   if ((view.youPlaced || view.youDenOut) && !view.isFinished && !view.isSpectator) {
-    screen.append(placedNotice(view));
+    main.append(placedNotice(view));
   }
 
   if (state.chop !== null && !view.youPlaced && !view.youDenOut && !view.isSpectator) {
-    screen.append(chopPanel(state.chop, actions));
+    main.append(chopPanel(state.chop, actions));
   }
 
   const tourResult = isTourResultStale(state.tour.result, view.roundIndex)
@@ -694,10 +942,30 @@ export function renderTable(
     });
 
     actionBar.append(play, pass, surrender);
-    screen.append(hand, actionBar);
+    main.append(hand, actionBar);
   }
 
+  // Render lại thay toàn bộ DOM: giữ focus + vị trí con trỏ trong ô chat.
+  const active = document.activeElement;
+  const chatInputTestId =
+    active instanceof HTMLElement ? active.dataset['testid'] : undefined;
+  const hadChatFocus = chatInputTestId === 'chat-input';
+  const caret = hadChatFocus ? (active as HTMLTextAreaElement).selectionStart : null;
+
   mount.replaceChildren(screen);
+
+  if (hadChatFocus) {
+    const input = mount.querySelector<HTMLTextAreaElement>('[data-testid="chat-input"]');
+    if (input !== null && !input.disabled) {
+      input.focus();
+      if (caret !== null) input.setSelectionRange(caret, caret);
+    }
+  }
+
+  // Chat luôn cuộn xuống tin mới nhất.
+  const messages = mount.querySelector<HTMLElement>('[data-testid="chat-messages"]');
+  if (messages !== null) messages.scrollTop = messages.scrollHeight;
+
   const dialog = mount.querySelector<HTMLElement>('.result-overlay');
   if (dialog !== null) activateDialog(dialog);
 }

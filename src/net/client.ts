@@ -1,6 +1,7 @@
 import type {
   ActionLogView,
   CardView,
+  ChatMessageView,
   ClientMessage,
   DenBaiView,
   PublicGameState,
@@ -43,7 +44,12 @@ export interface ClientSnapshot {
   readonly tourEnd: TourEndView | null;
   /** Danh sách phòng ở sảnh; null = chưa có dữ liệu (đang tải / chưa xin). */
   readonly roomList: readonly RoomSummaryView[] | null;
+  /** Lịch sử + tin chat live của phòng hiện tại (tối đa `CHAT_HISTORY_MAX`). */
+  readonly chatMessages: readonly ChatMessageView[];
 }
+
+/** Số tin chat client giữ lại (khớp `CHAT_HISTORY_MAX` phía server). */
+const CHAT_KEEP_MAX = 50;
 
 export interface GameClientOptions {
   readonly url: string;
@@ -104,6 +110,7 @@ export class GameClient {
     tourPaused: null,
     tourEnd: null,
     roomList: null,
+    chatMessages: [],
   };
 
   constructor(options: GameClientOptions) {
@@ -159,6 +166,7 @@ export class GameClient {
       tourPaused: null,
       tourEnd: null,
       roomList: null,
+      chatMessages: [],
     });
     this.openSocket();
   }
@@ -229,6 +237,7 @@ export class GameClient {
       tourPaused: null,
       tourEnd: null,
       roomList: null,
+      chatMessages: [],
     });
     this.listRooms();
     return true;
@@ -280,6 +289,13 @@ export class GameClient {
   newTour(soVan?: number): boolean {
     this.clearError();
     return this.send({ t: 'newTour', ...(soVan === undefined ? {} : { soVan }) });
+  }
+
+  /** Chat phòng; server validate role + rate limit rồi broadcast `chat`. */
+  sendChat(text: string): boolean {
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return false;
+    return this.send({ t: 'chat', text: trimmed });
   }
 
   private openSocket(): void {
@@ -349,7 +365,10 @@ export class GameClient {
       type !== 'tourResult' &&
       type !== 'tourPaused' &&
       type !== 'tourEnd' &&
-      type !== 'roomList'
+      type !== 'roomList' &&
+      type !== 'chat' &&
+      type !== 'chatHistory' &&
+      type !== 'leftTour'
     ) {
       return;
     }
@@ -378,6 +397,7 @@ export class GameClient {
             error: null,
             reconnectAttempt: 0,
             roomList: null,
+            ...(roomChanged ? { chatMessages: [] } : {}),
           });
           this.listRooms();
           return;
@@ -423,6 +443,39 @@ export class GameClient {
       case 'tourEnd':
         this.update({ tourEnd: message.summary, tourResult: null, tourPaused: null });
         return;
+      case 'chatHistory':
+        this.update({ chatMessages: message.messages.slice(-CHAT_KEEP_MAX) });
+        return;
+      case 'chat':
+        this.update({
+          chatMessages: [...this.snapshot.chatMessages, message.message].slice(-CHAT_KEEP_MAX),
+        });
+        return;
+      case 'leftTour':
+        // Đã rời tour: server detach khỏi phòng nhưng giữ socket để về sảnh ngay.
+        this.token = null;
+        this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
+        this.reconnectStartedAt = null;
+        this.reconnectAttempt = 0;
+        this.clearReconnectTimer();
+        this.update({
+          status: 'open',
+          room: null,
+          state: null,
+          stateReceivedAt: 0,
+          hand: [],
+          actionLog: [],
+          error: null,
+          reconnectAttempt: 0,
+          lastDenBai: null,
+          tourResult: null,
+          tourPaused: null,
+          tourEnd: null,
+          roomList: null,
+          chatMessages: [],
+        });
+        this.listRooms();
+        return;
       case 'roomList': {
         const current = this.snapshot.room;
         const spectating =
@@ -451,6 +504,7 @@ export class GameClient {
             tourPaused: null,
             tourEnd: null,
             roomList: message.rooms,
+            chatMessages: [],
           });
           return;
         }
@@ -510,6 +564,7 @@ export class GameClient {
       tourResult: null,
       tourPaused: null,
       tourEnd: null,
+      chatMessages: [],
     });
   }
 

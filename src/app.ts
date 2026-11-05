@@ -34,6 +34,7 @@ import { resolveTourCount, validateTourCountInput } from './ui/tour';
 import {
   buildLobbyView,
   buildTableView,
+  isSpectatorRoom,
   NICKNAME_MAX_LENGTH,
   normalizeNickname,
   normalizeRoomCode,
@@ -93,6 +94,10 @@ export class App {
   private roomListError: string | null = null;
   private roomListTimer: ReturnType<typeof setTimeout> | null = null;
   private roomListWaitStartedAt: number | null = null;
+  /** Nội dung đang soạn trong panel chat; giữ qua các lần render. */
+  private chatDraft = '';
+  /** Panel đang mở trên mobile (desktop luôn hiện cả hai). */
+  private openPanel: 'leaderboard' | 'chat' | null = null;
 
   private readonly lobbyActions: LobbyActions = {
     createRoom: (nickname, soVan) => {
@@ -273,6 +278,7 @@ export class App {
       this.resetHandOrderState();
       this.localError = null;
       this.lastErrorKey = null;
+      this.resetPanels();
       this.client.leaveRoom();
     },
     leaveWatch: () => {
@@ -297,6 +303,7 @@ export class App {
       }
       this.selected.clear();
       this.chopSentFor = null;
+      this.resetPanels();
       this.client.leaveTour();
     },
     endTour: () => {
@@ -310,6 +317,27 @@ export class App {
         ? soVan
         : resolveTourCount(this.form.tourCount);
       this.client.newTour(count);
+    },
+    sendChat: () => {
+      const text = this.chatDraft.trim();
+      if (text.length === 0) return;
+      // Giữ draft khi gửi lỗi để người chơi không mất nội dung đã gõ.
+      if (!this.client.sendChat(text)) return;
+      this.chatDraft = '';
+      this.render();
+    },
+    onChatDraftChange: (value) => {
+      this.chatDraft = value;
+      this.syncChatSendState();
+    },
+    togglePanel: (panel) => {
+      this.openPanel = this.openPanel === panel ? null : panel;
+      this.render();
+    },
+    closePanel: () => {
+      if (this.openPanel === null) return;
+      this.openPanel = null;
+      this.render();
     },
   };
 
@@ -404,6 +432,23 @@ export class App {
     this.handRoomCode = null;
   }
 
+  /** Xoá trạng thái panel chat/BXH khi rời phòng hoặc rời tour. */
+  private resetPanels(): void {
+    this.chatDraft = '';
+    this.openPanel = null;
+  }
+
+  /** Cập nhật nút Gửi ngay khi gõ (không render lại để không phá IME/focus). */
+  private syncChatSendState(): void {
+    const send = this.root.querySelector<HTMLButtonElement>('[data-testid="chat-send"]');
+    if (send === null) return;
+    const snapshot = this.client.getSnapshot();
+    send.disabled =
+      isSpectatorRoom(snapshot.room) ||
+      snapshot.status !== 'open' ||
+      this.chatDraft.trim().length === 0;
+  }
+
   /** Thoát chế độ khán giả: xoá phiên local, giữ socket, xin lại danh sách phòng. */
   private leaveWatchSession(): void {
     this.selected.clear();
@@ -412,6 +457,7 @@ export class App {
     clearSavedSession();
     this.localError = null;
     this.lastErrorKey = null;
+    this.resetPanels();
     this.client.leaveWatch();
   }
 
@@ -483,6 +529,8 @@ export class App {
     this.watchRoomList(snapshot);
     // Ở sảnh với socket mở thì phiên phòng cũ (kể cả khán giả) không còn giá trị.
     if (snapshot.room === null && snapshot.status === 'open') clearSavedSession();
+    // Rời phòng/rời tour: bỏ draft + panel đang mở để sảnh sạch trạng thái.
+    if (snapshot.room === null) this.resetPanels();
     if (snapshot.error === null) this.lastErrorKey = null;
     else {
       if (snapshot.error.code === 'SESSION_REPLACED') this.sessionReplaced = true;
@@ -568,6 +616,9 @@ export class App {
           muted: this.ticker.isMuted(),
           chop,
           breakdown: parseBreakdown(rawBreakdown),
+          chatMessages: snapshot.chatMessages,
+          chatDraft: this.chatDraft,
+          openPanel: this.openPanel,
           tour: {
             result: snapshot.tourResult,
             paused: snapshot.tourPaused,

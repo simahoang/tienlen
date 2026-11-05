@@ -1660,3 +1660,293 @@ body.is-dragging-card {
   flex: 1;
   min-height: 44px;
 }
+
+/* Panel 2 ben ban bai: Bang xep hang (trai) + Chat (phai) */
+.table-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+.table-main {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+.side-panel {
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel);
+}
+
+.side-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.side-panel__title {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.side-panel__body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.side-panel__empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.side-panel__close {
+  display: none;
+}
+
+.table-head__toggles {
+  display: flex;
+  gap: 6px;
+}
+
+/* Bang xep hang */
+.lb-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.lb-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.lb-row--you {
+  background: rgba(242, 193, 78, 0.12);
+  border: 1px solid rgba(242, 193, 78, 0.35);
+}
+
+.lb-row--left {
+  opacity: 0.6;
+}
+
+.lb-row__rank {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.lb-row__main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.lb-row__name-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.lb-row__name {
+  font-weight: 700;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.lb-row__meta {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.lb-row__points {
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Chat */
+.chat-messages {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.chat-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.chat-msg--you {
+  background: rgba(143, 227, 174, 0.1);
+}
+
+.chat-msg__meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.72rem;
+}
+
+.chat-msg__name {
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.chat-msg__time {
+  margin-left: auto;
+  color: var(--muted);
+}
+
+.chat-msg__text {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.chat-empty,
+.chat-readonly {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.chat-compose {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.chat-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 40px;
+  max-height: 96px;
+  padding: 8px 10px;
+  resize: none;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.25);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.chat-input:disabled {
+  opacity: 0.6;
+}
+
+.chat-send {
+  flex: 0 0 auto;
+  min-height: 40px;
+}
+
+/* Mobile/tablet: panel la drawer, chi hien khi duoc mo */
+@media (max-width: 1099.98px) {
+  .side-panel--open {
+    display: flex;
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    z-index: 60;
+    width: min(86vw, 340px);
+    padding: calc(env(safe-area-inset-top, 0px) + 14px) 12px
+      calc(env(safe-area-inset-bottom, 0px) + 14px);
+    border-radius: 0;
+    background: #10352a;
+    box-shadow: 0 0 40px rgba(0, 0, 0, 0.6);
+  }
+
+  .side-panel--leaderboard.side-panel--open {
+    left: 0;
+    border-right: 1px solid var(--line);
+  }
+
+  .side-panel--chat.side-panel--open {
+    right: 0;
+    border-left: 1px solid var(--line);
+  }
+
+  .side-panel--open .side-panel__close {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .side-panel--open .chat-messages {
+    max-height: none;
+  }
+}
+
+/* Desktop rong: 3 cot, panel sticky */
+@media (min-width: 1100px) {
+  .screen--table {
+    max-width: 1400px;
+  }
+
+  .table-layout {
+    display: grid;
+    grid-template-columns: 220px minmax(0, 1fr) 280px;
+    gap: 12px;
+    align-items: start;
+    flex: 0 0 auto;
+  }
+
+  .side-panel {
+    display: flex;
+    position: sticky;
+    top: 16px;
+    max-height: calc(100dvh - 32px);
+  }
+
+  .side-panel__close,
+  .table-head__toggles {
+    display: none;
+  }
+
+  .chat-messages {
+    max-height: none;
+  }
+}

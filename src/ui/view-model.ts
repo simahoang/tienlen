@@ -1,5 +1,6 @@
 import type {
   CardView,
+  LeaderboardRowView,
   PublicGameState,
   RankingView,
   RoomPhase,
@@ -174,6 +175,8 @@ export interface TableViewModel {
   readonly spectatorCount: number;
   /** Khán giả có thể xin vào ghế trống (lobby, còn ghế, tour không chạy). */
   readonly canTakeSeat: boolean;
+  /** Bảng xếp hạng tour live (panel trái); rỗng = phòng không mở tour. */
+  readonly leaderboard: readonly LeaderboardRowView[];
 }
 
 const PHASE_LABELS: Readonly<Record<RoomPhase, string>> = {
@@ -315,5 +318,6 @@ export function buildTableView(
     isSpectator,
     spectatorCount,
     canTakeSeat,
+    leaderboard: room.leaderboard ?? [],
   };
 }

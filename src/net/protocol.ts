@@ -13,6 +13,13 @@ export const ROOM_CODE_LENGTH = 5;
 export const NICKNAME_MAX = 20;
 /** Số khán giả tối đa mỗi phòng (doc-5 §4.1). */
 export const MAX_SPECTATORS = 10;
+/** Độ dài tối đa một tin chat (ký tự, sau khi trim/bỏ control chars). */
+export const CHAT_MAX = 200;
+/** Số tin chat giữ lại trong history của phòng. */
+export const CHAT_HISTORY_MAX = 50;
+/** Rate limit chat: tối đa `CHAT_RATE_MAX` tin / `CHAT_RATE_WINDOW_MS` mỗi account. */
+export const CHAT_RATE_MAX = 5;
+export const CHAT_RATE_WINDOW_MS = 5000;
 
 const ROOM_CODE_PATTERN = /^[A-Z0-9]{4,6}$/;
 const CARD_ID_PATTERN = /^(3|4|5|6|7|8|9|10|J|Q|K|A|2)-(spades|clubs|diamonds|hearts)$/;
@@ -33,6 +40,28 @@ export interface RoomPlayerView {
 
 export type RoomRole = 'player' | 'spectator';
 
+/** Một hàng bảng xếp hạng tour live (panel trái). Không chứa account/token/hand. */
+export interface LeaderboardRowView {
+  readonly seat: number;
+  readonly nickname: string;
+  readonly pointsTotal: number;
+  readonly wins: number;
+  readonly roundsPlayed: number;
+  /** true khi người này đã rời tour (ghế có thể đã được người khác dùng). */
+  readonly left: boolean;
+}
+
+/** Một tin chat trong phòng; `role` cho client biết hiển thị badge khán giả/người chơi. */
+export interface ChatMessageView {
+  readonly id: string;
+  readonly seat: number;
+  readonly nickname: string;
+  readonly role: RoomRole;
+  readonly text: string;
+  /** epoch ms server lúc nhận tin. */
+  readonly at: number;
+}
+
 export interface RoomView {
   readonly code: string;
   readonly hostSeat: number;
@@ -41,6 +70,11 @@ export interface RoomView {
   readonly players: readonly RoomPlayerView[];
   /** Thông tin tour của phòng; vắng mặt = phòng chưa mở tour (lobby cũ). */
   readonly tour?: TourView;
+  /**
+   * Bảng xếp hạng tour live cho panel trái; chỉ có khi phòng có tour.
+   * Đã sắp sẵn (điểm desc, thắng desc, ghế asc); không chứa account/token/hand.
+   */
+  readonly leaderboard?: readonly LeaderboardRowView[];
   /** Số khán giả đang xem; vắng mặt = client cũ / phòng không có khán giả. */
   readonly spectatorCount?: number;
   /**
@@ -275,6 +309,8 @@ export type ClientMessage =
   | { readonly t: 'endTour' }
   /** Tour mới cùng ghế: tour_id mới, điểm từ 0. */
   | { readonly t: 'newTour'; readonly soVan?: number }
+  /** Chat phòng: chỉ người chơi gửi được; server validate + rate limit + broadcast. */
+  | { readonly t: 'chat'; readonly text: string }
   | { readonly t: 'reconnect'; readonly token: string };
 
 export type ServerMessage =
@@ -306,6 +342,12 @@ export type ServerMessage =
     }
   | { readonly t: 'tourPaused'; readonly paused: TourPausedView; readonly serverNow: number }
   | { readonly t: 'tourEnd'; readonly summary: TourEndView; readonly serverNow: number }
+  /** Một tin chat mới, broadcast cho người chơi + khán giả trong phòng. */
+  | { readonly t: 'chat'; readonly message: ChatMessageView }
+  /** Lịch sử chat (tối đa CHAT_HISTORY_MAX) gửi khi join/reconnect. */
+  | { readonly t: 'chatHistory'; readonly messages: readonly ChatMessageView[] }
+  /** Người chơi đã rời tour và được detach khỏi phòng; client về sảnh. */
+  | { readonly t: 'leftTour' }
   | { readonly t: 'error'; readonly code: string; readonly message: string };
 
 export type ParseResult =
@@ -329,6 +371,14 @@ function parseNickname(value: unknown): string | null {
   // Loại ký tự điều khiển để log/UI không bị phá.
   if (/[\u0000-\u001f\u007f]/.test(nickname)) return null;
   return nickname;
+}
+
+/** Chat: trim, bỏ control chars, phải còn 1..CHAT_MAX ký tự; null = không hợp lệ. */
+function parseChatText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const text = value.replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  if (text.length === 0 || text.length > CHAT_MAX) return null;
+  return text;
 }
 
 function parseRoomCode(value: unknown): string | null {
@@ -427,6 +477,11 @@ export function parseClientMessage(raw: string): ParseResult {
       return { ok: true, message: { t: 'leaveTour' } };
     case 'endTour':
       return { ok: true, message: { t: 'endTour' } };
+    case 'chat': {
+      const text = parseChatText(parsed['text']);
+      if (!text) return fail('INVALID_CHAT', `tin nhắn phải 1-${CHAT_MAX} ký tự`);
+      return { ok: true, message: { t: 'chat', text } };
+    }
     case 'chop': {
       const cards = parseCardIds(parsed['cards']);
       if (!cards) return fail('INVALID_CARDS', 'cards phải là 1-13 card id duy nhất');
