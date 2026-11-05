@@ -2,9 +2,13 @@ import type {
   ActionLogView,
   CardView,
   ClientMessage,
+  DenBaiView,
   PublicGameState,
   RoomView,
   ServerMessage,
+  TourEndView,
+  TourPausedView,
+  TourResultView,
 } from './protocol';
 
 /**
@@ -28,6 +32,14 @@ export interface ClientSnapshot {
   readonly actionLog: readonly ActionLogView[];
   readonly error: ClientError | null;
   readonly reconnectAttempt: number;
+  /** Lần đền 13 lá gần nhất server broadcast; null = chưa có. */
+  readonly lastDenBai: DenBaiView | null;
+  /** Bảng điểm ván + điểm tour gần nhất (overlay KET_QUA_VAN); null = chưa có. */
+  readonly tourResult: TourResultView | null;
+  /** TAM_DUNG khi thiếu người; null = không tạm dừng. */
+  readonly tourPaused: TourPausedView | null;
+  /** Bảng tổng kết cuối tour; null = tour chưa kết thúc. */
+  readonly tourEnd: TourEndView | null;
 }
 
 export interface GameClientOptions {
@@ -84,6 +96,10 @@ export class GameClient {
     actionLog: [],
     error: null,
     reconnectAttempt: 0,
+    lastDenBai: null,
+    tourResult: null,
+    tourPaused: null,
+    tourEnd: null,
   };
 
   constructor(options: GameClientOptions) {
@@ -134,6 +150,10 @@ export class GameClient {
       actionLog: [],
       error: null,
       reconnectAttempt: 0,
+      lastDenBai: null,
+      tourResult: null,
+      tourPaused: null,
+      tourEnd: null,
     });
     this.openSocket();
   }
@@ -153,9 +173,13 @@ export class GameClient {
     if (this.snapshot.error) this.update({ error: null });
   }
 
-  createRoom(nickname: string): boolean {
+  createRoom(nickname: string, soVan?: number): boolean {
     this.clearError();
-    return this.send({ t: 'createRoom', nickname: nickname.trim() });
+    return this.send({
+      t: 'createRoom',
+      nickname: nickname.trim(),
+      ...(soVan === undefined ? {} : { soVan }),
+    });
   }
 
   joinRoom(code: string, nickname: string): boolean {
@@ -191,6 +215,24 @@ export class GameClient {
   chop(cards: readonly string[], targetActionId: string): boolean {
     this.clearError();
     return this.send({ t: 'chop', cards, targetActionId });
+  }
+
+  /** Rời tour: bỏ điểm tour, trả ghế trống (doc-4 §5.4). */
+  leaveTour(): boolean {
+    this.clearError();
+    return this.send({ t: 'leaveTour' });
+  }
+
+  /** Chủ phòng kết thúc sớm tour đang dừng/giữa các ván (doc-4 §3.1). */
+  endTour(): boolean {
+    this.clearError();
+    return this.send({ t: 'endTour' });
+  }
+
+  /** Tour mới cùng ghế sau bảng tổng kết; điểm từ 0. */
+  newTour(soVan?: number): boolean {
+    this.clearError();
+    return this.send({ t: 'newTour', ...(soVan === undefined ? {} : { soVan }) });
   }
 
   private openSocket(): void {
@@ -250,7 +292,17 @@ export class GameClient {
     }
     if (!isRecord(parsed)) return;
     const type = parsed['t'];
-    if (type !== 'room' && type !== 'state' && type !== 'error') return;
+    if (
+      type !== 'room' &&
+      type !== 'state' &&
+      type !== 'error' &&
+      type !== 'denBai' &&
+      type !== 'tourResult' &&
+      type !== 'tourPaused' &&
+      type !== 'tourEnd'
+    ) {
+      return;
+    }
     this.handleMessage(parsed as unknown as ServerMessage);
   }
 
@@ -282,6 +334,22 @@ export class GameClient {
           return;
         }
         this.update({ error: { code: message.code, message: message.message } });
+        return;
+      case 'denBai':
+        this.update({ lastDenBai: message.event });
+        return;
+      case 'tourResult':
+        this.update({
+          tourResult: message.result,
+          tourPaused: null,
+          tourEnd: null,
+        });
+        return;
+      case 'tourPaused':
+        this.update({ tourPaused: message.paused, tourEnd: null });
+        return;
+      case 'tourEnd':
+        this.update({ tourEnd: message.summary, tourResult: null, tourPaused: null });
         return;
     }
   }
@@ -333,6 +401,9 @@ export class GameClient {
       hand: [],
       actionLog: [],
       reconnectAttempt: 0,
+      tourResult: null,
+      tourPaused: null,
+      tourEnd: null,
     });
   }
 

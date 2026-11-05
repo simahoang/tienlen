@@ -1,15 +1,18 @@
+import { rules } from '../data';
 import type { ConnectionStatus } from '../net/client';
 
 const SERVER_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   ROOM_NOT_FOUND: 'Không tìm thấy phòng. Kiểm tra lại mã phòng.',
   ROOM_FULL: 'Phòng đã đủ người (tối đa 4).',
   GAME_IN_PROGRESS: 'Ván đã bắt đầu, không thể vào lúc này.',
+  TOUR_IN_PROGRESS: 'Tour đang diễn ra, không thể vào giữa tour.',
   ROOM_NOT_LOBBY: 'Ván đã bắt đầu, không đổi trạng thái phòng chờ được nữa.',
   NOT_HOST: 'Chỉ chủ phòng mới được bắt đầu ván.',
   NOT_ENOUGH_PLAYERS: 'Cần ít nhất 2 người để bắt đầu.',
   ALREADY_IN_ROOM: 'Bạn đã ở trong một phòng.',
   NOT_IN_ROOM: 'Bạn chưa ở trong phòng nào.',
   INVALID_NICKNAME: 'Nickname phải từ 1 đến 20 ký tự.',
+  INVALID_TOUR_COUNT: `Số ván phải là số nguyên từ ${rules.tour.min} đến ${rules.tour.max}.`,
   INVALID_CODE: 'Mã phòng phải gồm 4-6 ký tự A-Z hoặc 0-9.',
   INVALID_CARDS: 'Bộ bài chọn không hợp lệ.',
   INVALID_TOKEN: 'Phiên chơi không còn hợp lệ.',

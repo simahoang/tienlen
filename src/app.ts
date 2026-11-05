@@ -21,8 +21,9 @@ import {
   resetChopAttempt,
   toggleSelection,
 } from './ui/table-logic';
-import { startChopCountdown, startTurnTimer } from './ui/timer';
+import { startChopCountdown, startTourCountdown, startTurnTimer } from './ui/timer';
 import { showToast } from './ui/toast';
+import { resolveTourCount, validateTourCountInput } from './ui/tour';
 import {
   buildLobbyView,
   buildTableView,
@@ -37,6 +38,8 @@ import {
 interface FormState {
   nickname: string;
   code: string;
+  /** Ô số ván/tour dạng chuỗi; rỗng = dùng `rules.tour.defaultCount`. */
+  tourCount: string;
 }
 
 const EXPIRED_CODES: ReadonlySet<string> = new Set([
@@ -57,12 +60,13 @@ const RELOGIN_CODES: ReadonlySet<string> = new Set([
 export class App {
   readonly client: GameClient;
   private readonly root: HTMLElement;
-  private readonly form: FormState = { nickname: '', code: '' };
+  private readonly form: FormState = { nickname: '', code: '', tourCount: String(rules.tour.defaultCount) };
   private readonly ticker = new Ticker();
   private selected: Set<string> = new Set();
   private chopSentFor: string | null = null;
   private stopTimer: (() => void) | null = null;
   private stopChopTimer: (() => void) | null = null;
+  private stopTourTimer: (() => void) | null = null;
   private localError: string | null = null;
   private lastErrorKey: string | null = null;
   private auth: AuthSession | null = null;
@@ -74,14 +78,24 @@ export class App {
   private sessionReplaced = false;
 
   private readonly lobbyActions: LobbyActions = {
-    createRoom: (nickname) => {
+    createRoom: (nickname, soVan) => {
       const error = validateNickname(nickname);
       if (error !== null) {
         this.fail(error);
         return;
       }
+      const tourCheck = validateTourCountInput(this.form.tourCount);
+      if (tourCheck.error !== null) {
+        this.fail(tourCheck.error);
+        return;
+      }
+      const count = soVan ?? resolveTourCount(this.form.tourCount);
+      if (count < rules.tour.min || count > rules.tour.max) {
+        this.fail(`Số ván phải nằm trong khoảng ${rules.tour.min}–${rules.tour.max}.`);
+        return;
+      }
       this.localError = null;
-      this.client.createRoom(normalizeNickname(nickname));
+      this.client.createRoom(normalizeNickname(nickname), count);
     },
     joinRoom: (code, nickname) => {
       const nicknameError = validateNickname(nickname);
@@ -128,6 +142,8 @@ export class App {
       this.stopTimer = null;
       this.stopChopTimer?.();
       this.stopChopTimer = null;
+      this.stopTourTimer?.();
+      this.stopTourTimer = null;
       this.selected.clear();
       this.chopSentFor = null;
       clearSavedSession();
@@ -140,6 +156,10 @@ export class App {
     },
     onCodeChange: (value) => {
       this.form.code = value;
+      this.localError = null;
+    },
+    onTourCountChange: (value) => {
+      this.form.tourCount = value;
       this.localError = null;
     },
   };
@@ -198,12 +218,31 @@ export class App {
       this.stopTimer = null;
       this.stopChopTimer?.();
       this.stopChopTimer = null;
+      this.stopTourTimer?.();
+      this.stopTourTimer = null;
       clearSavedSession();
       this.selected.clear();
       this.chopSentFor = null;
       this.localError = null;
       this.lastErrorKey = null;
       this.client.leaveRoom();
+    },
+    leaveTour: () => {
+      this.selected.clear();
+      this.chopSentFor = null;
+      this.client.leaveTour();
+    },
+    endTour: () => {
+      this.client.endTour();
+    },
+    newTour: (soVan) => {
+      this.selected.clear();
+      this.chopSentFor = null;
+      this.localError = null;
+      const count = soVan >= rules.tour.min && soVan <= rules.tour.max
+        ? soVan
+        : resolveTourCount(this.form.tourCount);
+      this.client.newTour(count);
     },
   };
 
@@ -324,6 +363,8 @@ export class App {
     this.stopTimer = null;
     this.stopChopTimer?.();
     this.stopChopTimer = null;
+    this.stopTourTimer?.();
+    this.stopTourTimer = null;
 
     const previousCards = this.root.querySelector<HTMLElement>('[data-testid="hand"] .hand__cards');
     const scrollLeft = previousCards ? previousCards.scrollLeft : 0;
@@ -360,6 +401,8 @@ export class App {
             }
           : null;
       const rawBreakdown = (state as unknown as Record<string, unknown> | null)?.['breakdown'];
+      const tourServerNow = state?.serverNow ?? Date.now();
+      const tourReceivedAt = state !== null ? snapshot.stateReceivedAt : Date.now();
 
       renderTable(
         this.root,
@@ -376,9 +419,33 @@ export class App {
           muted: this.ticker.isMuted(),
           chop,
           breakdown: parseBreakdown(rawBreakdown),
+          tour: {
+            result: snapshot.tourResult,
+            paused: snapshot.tourPaused,
+            end: snapshot.tourEnd,
+            denBai: snapshot.lastDenBai,
+            maxSeats: snapshot.room.maxSeats,
+            isHost: snapshot.room.hostSeat === snapshot.room.you.seat,
+            phase: snapshot.room.tour?.phase ?? null,
+            serverNow: tourServerNow,
+            receivedAt: tourReceivedAt,
+          },
         },
         this.tableActions,
       );
+
+      const tourResultSnapshot = snapshot.tourResult;
+      if (tourResultSnapshot !== null && tourResultSnapshot.nextRoundAt !== null) {
+        const tourCountdown = this.root.querySelector<HTMLElement>(
+          '[data-testid="tour-countdown"]',
+        );
+        if (tourCountdown !== null) {
+          this.stopTourTimer = startTourCountdown(tourCountdown, {
+            nextRoundAt: tourResultSnapshot.nextRoundAt,
+            serverNow: tourServerNow,
+          });
+        }
+      }
 
       const nextCards = this.root.querySelector<HTMLElement>('[data-testid="hand"] .hand__cards');
       if (nextCards) nextCards.scrollLeft = scrollLeft;

@@ -14,6 +14,7 @@ import type {
   ChopAttacker,
   ChopTarget,
   DeckConfig,
+  FirstPlayerSubsequentConfig,
   StartingPlayerConfig,
   ToiTrangCombo,
 } from './types';
@@ -53,7 +54,10 @@ export interface ScoringRulesInput {
 export interface DenBaiInput {
   readonly enabled: boolean;
   readonly chatChongGanhChuoi: boolean;
-  readonly chatChongTheoGiaTriMucTieu: boolean;
+  /** rev6: pot cộng dồn = tổng giá trị mọi nước trong chuỗi (bỏ revert về 0). */
+  readonly chatChongCongDon?: boolean;
+  /** rev5 cũ, chỉ dùng khi `chatChongCongDon` tắt. */
+  readonly chatChongTheoGiaTriMucTieu?: boolean;
 }
 
 export interface GameRulesInput {
@@ -69,6 +73,9 @@ export interface GameRulesInput {
   readonly chatNgoaiLuot: ChatNgoaiLuotInput;
   readonly toiTrang: ToiTrangInput;
   readonly denBai?: DenBaiInput;
+  /** doc-4 §4.2/§4.3 — luật đi trước ván ≥ 2 của tour. */
+  readonly firstPlayerSubsequent?: FirstPlayerSubsequentConfig;
+  readonly turn?: { readonly autoPlayLowestWhenLeading?: boolean };
 }
 
 export interface CreateGameOptions {
@@ -81,6 +88,15 @@ export interface CreateGameOptions {
    */
   readonly hands?: readonly (readonly Card[])[];
   readonly startingPlayerIndex?: number;
+  /**
+   * doc-4 §4.2: ghế đi trước do caller quyết định (ván ≥ 2 = hạng Nhất ván trước).
+   * Không truyền → ván 1, suy ra từ 3♠ như cũ hoặc từ `startingPlayerIndex`.
+   */
+  readonly firstSeat?: number;
+  /** doc-4 §4.2: lượt đầu đánh tự do (bỏ ràng buộc 3♠). Mặc định theo `roundIndex`. */
+  readonly firstMoveFree?: boolean;
+  /** Số thứ tự ván trong tour, 1..N. Mặc định 1. */
+  readonly roundIndex?: number;
 }
 
 export type Place = 'nhat' | 'nhi' | 'ba' | 'bet';
@@ -90,6 +106,8 @@ export interface GamePlayer {
   /** Bài trên tay. Giữ lại cả khi đã xin hàng để pha 3 tính thối. */
   readonly hand: readonly Card[];
   readonly surrendered: boolean;
+  /** rev6 §1.7: giữ đủ 13 lá khi có Nhất → ra khỏi ván, không hạng, không thối. */
+  readonly denOut?: boolean;
 }
 
 export interface PlayRecord {
@@ -187,6 +205,10 @@ export interface GameState {
   readonly turn: number;
   readonly startingPlayerIndex: number;
   readonly firstMustContain3S: boolean;
+  /** doc-4 §4.2: ván ≥ 2 lượt đầu tự do (không bắt buộc chứa 3♠). */
+  readonly firstMoveFree: boolean;
+  /** Số thứ tự ván trong tour (1 = ván đầu). */
+  readonly roundIndex: number;
   readonly firstPlayDone: boolean;
   readonly trick: TrickState;
   readonly ranking: readonly Placement[];
@@ -219,7 +241,9 @@ export type GameErrorCode =
   | 'TURN_PAUSED'
   | 'WINDOW_CLOSED'
   | 'INVALID_TARGET'
-  | 'LOST_RACE';
+  | 'LOST_RACE'
+  /** Cấu hình tắt auto đánh khi mở vòng (`timeoutLeadPlaysLowest=false`). */
+  | 'LEAD_AUTO_DISABLED';
 
 export interface GameError {
   readonly code: GameErrorCode;
@@ -299,7 +323,21 @@ function containsPrimary(cards: readonly Card[], firstPlayer: StartingPlayerConf
 }
 
 function isPlayablePlayer(player: GamePlayer): boolean {
-  return !player.surrendered && player.hand.length > 0;
+  return !player.surrendered && player.hand.length > 0 && player.denOut !== true;
+}
+
+/** rev6 §1.7: khi đã có Nhất, mọi ghế còn đủ 13 lá ra khỏi ván ngay. */
+function applyDenBai(state: GameState): GameState {
+  if (!(state.rules.denBai?.enabled ?? true)) return state;
+  const fullHand = state.rules.deal.cardsPerPlayer;
+  let changed = false;
+  const players = state.players.map((player) => {
+    if (player.denOut === true || player.surrendered) return player;
+    if (player.hand.length !== fullHand) return player;
+    changed = true;
+    return { ...player, denOut: true };
+  });
+  return changed ? { ...state, players } : state;
 }
 
 function resolveHandCards(
@@ -358,6 +396,66 @@ function placeOf(index: number, count: number): Place {
   return 'ba';
 }
 
+const PLACE_ORDER: readonly Place[] = ['nhat', 'nhi', 'ba', 'bet'];
+
+/** §1.7: 4 người đủ 4 hạng; 3 người Nhất/Nhì/Bét (không có Ba); 2 người Nhất/Bét. */
+function placesForCount(count: number): readonly Place[] {
+  if (count <= 2) return ['nhat', 'bet'];
+  if (count === 3) return ['nhat', 'nhi', 'bet'];
+  return PLACE_ORDER;
+}
+
+function placeOrderIndex(place: Place): number {
+  return PLACE_ORDER.indexOf(place);
+}
+
+/** Các hạng chưa chốt, xếp từ cao xuống thấp. */
+function remainingPlaces(state: GameState): Place[] {
+  const used = new Set(state.ranking.map((entry) => entry.place));
+  return placesForCount(state.playerCount).filter((place) => !used.has(place));
+}
+
+/** Ghi một hạng vào `state.ranking`, giữ mảng luôn xếp từ Nhất xuống Bét. */
+function addPlacement(state: GameState, seat: number, place: Place): GameState {
+  const cardsLeft = state.players[seat]?.hand.length ?? 0;
+  const ranking = [...state.ranking, { seat, place, cardsLeft }].sort(
+    (a, b) => placeOrderIndex(a.place) - placeOrderIndex(b.place),
+  );
+  return { ...state, ranking };
+}
+
+/** Ghế vừa hết bài nhận hạng cao nhất còn lại (thứ tự về = thứ tự hạng). */
+function recordFinish(state: GameState, seat: number): GameState {
+  const remaining = remainingPlaces(state);
+  const place = remaining[0];
+  if (!place) return state;
+  const ranked = addPlacement(state, seat, place);
+  // Có Nhất → xét đền 13 lá ngay tại thời điểm này.
+  return place === 'nhat' ? applyDenBai(ranked) : ranked;
+}
+
+/**
+ * §1.7: ván chỉ kết thúc khi còn ≤1 người chưa xếp hạng. Người cuối cùng
+ * nhận hạng cao nhất còn lại; đủ hạng thì mới phát `gameOver`.
+ */
+function finalizeRanking(state: GameState, events: GameEvent[]): GameState {
+  const ranked = new Set(state.ranking.map((entry) => entry.seat));
+  const unranked = state.players.filter(
+    (player) => !ranked.has(player.seat) && player.denOut !== true,
+  );
+  if (unranked.length > 1) return state;
+
+  let next = state;
+  const last = unranked[0];
+  if (last) {
+    const place = remainingPlaces(next)[0];
+    if (place) next = addPlacement(next, last.seat, place);
+  }
+  next = { ...next, phase: 'finished', turn: -1, chopWindow: null };
+  events.push({ type: 'gameOver', ranking: next.ranking });
+  return next;
+}
+
 function highestCardOf(player: GamePlayer, order: CardOrder): Card | null {
   let highest: Card | null = null;
   for (const card of player.hand) {
@@ -366,7 +464,7 @@ function highestCardOf(player: GamePlayer, order: CardOrder): Card | null {
   return highest;
 }
 
-/** §1.7: ít lá hơn xếp trên; bằng số lá thì lá cao nhất thấp hơn xếp trên (đề xuất BA cần chốt). */
+/** Xếp hạng các nhà còn lại khi tới trắng: ít lá hơn xếp trên; bằng số lá thì lá cao nhất thấp hơn xếp trên. */
 function compareForRank(a: GamePlayer, b: GamePlayer, state: GameState): number {
   const bySize = a.hand.length - b.hand.length;
   if (bySize !== 0) return bySize;
@@ -385,6 +483,7 @@ function compareForRank(a: GamePlayer, b: GamePlayer, state: GameState): number 
   return a.seat - b.seat;
 }
 
+/** §2.2 tới trắng: ván dừng ngay, xếp các nhà còn lại theo số lá/lá cao nhất như cũ. */
 function finishGame(state: GameState, winnerSeat: number | null): GameState {
   const active = state.players.filter((player) => !player.surrendered);
   const winnerPlayer = winnerSeat === null ? undefined : state.players[winnerSeat];
@@ -537,11 +636,17 @@ function seatFailure(state: GameState, seat: number): ApplyResult | null {
   }
   const player = state.players[seat];
   if (!player) return failure(state, 'NOT_IN_GAME', `ghế không tồn tại: ${seat}`, seat);
+  if (player.hand.length === 0) {
+    return failure(state, 'PLAYER_OUT', `ghế ${seat} đã hết bài`, seat);
+  }
   if (state.trick.passed.includes(seat)) {
     return failure(state, 'ALREADY_PASSED', `ghế ${seat} đã pass trong vòng này`, seat);
   }
   if (player.surrendered) {
     return failure(state, 'PLAYER_OUT', `ghế ${seat} đã xin hàng`, seat);
+  }
+  if (player.denOut === true) {
+    return failure(state, 'PLAYER_OUT', `ghế ${seat} đã ra khỏi ván vì đền 13 lá`, seat);
   }
   if (state.turn !== seat) {
     return failure(
@@ -676,9 +781,9 @@ function handlePlay(
   }
 
   if ((players[intent.seat]?.hand.length ?? 0) === 0) {
-    const finished = finishGame(updated, intent.seat);
-    events.push({ type: 'gameOver', ranking: finished.ranking });
-    return { state: finished, events, error: null };
+    const finished = finalizeRanking(recordFinish(updated, intent.seat), events);
+    if (finished.phase === 'finished') return { state: finished, events, error: null };
+    return { state: settleAfterAction(finished, events), events, error: null };
   }
 
   const window = openChopWindow(updated, combo, cards, intent.seat, actionId, nowMs);
@@ -753,8 +858,14 @@ function handleSurrender(
   }
   const player = state.players[intent.seat];
   if (!player) return failure(state, 'NOT_IN_GAME', `ghế không tồn tại: ${intent.seat}`, intent.seat);
+  if (player.hand.length === 0) {
+    return failure(state, 'PLAYER_OUT', `ghế ${intent.seat} đã hết bài`, intent.seat);
+  }
   if (player.surrendered) {
     return failure(state, 'ALREADY_SURRENDERED', `ghế ${intent.seat} đã xin hàng`, intent.seat);
+  }
+  if (player.denOut === true) {
+    return failure(state, 'PLAYER_OUT', `ghế ${intent.seat} đã ra khỏi ván vì đền 13 lá`, intent.seat);
   }
 
   const events: GameEvent[] = [];
@@ -762,7 +873,9 @@ function handleSurrender(
   const players = base.players.map((entry) =>
     entry.seat === intent.seat ? { ...entry, surrendered: true } : entry,
   );
-  const updated: GameState = {
+  events.push({ type: 'surrender', seat: intent.seat });
+  // §1.7: người rời nhận hạng thấp nhất còn lại tại thời điểm rời; các ghế khác chơi tiếp.
+  let updated: GameState = {
     ...base,
     players,
     actionCount: base.actionCount + 1,
@@ -773,13 +886,15 @@ function handleSurrender(
       { type: 'surrender', actionId: `a${base.actionCount + 1}`, seat: intent.seat },
     ],
   };
-  events.push({ type: 'surrender', seat: intent.seat });
-  const active = players.filter((entry) => !entry.surrendered);
-  if (active.length <= 1) {
-    const finished = finishGame(updated, active[0]?.seat ?? null);
-    events.push({ type: 'gameOver', ranking: finished.ranking });
-    return { state: finished, events, error: null };
+  const remaining = remainingPlaces(updated);
+  const lowest = remaining[remaining.length - 1];
+  if (lowest) updated = addPlacement(updated, intent.seat, lowest);
+
+  const finalized = finalizeRanking(updated, events);
+  if (finalized.phase === 'finished') {
+    return { state: finalized, events, error: null };
   }
+  updated = finalized;
 
   // §3.3 + §1.3: người giữ 3♠ rời ván trước nước đầu → tính lại người đi trước
   // trong các ghế còn chơi (3♠ → 3♣ → 3♦ → 3♥ → lá thấp nhất).
@@ -910,9 +1025,9 @@ function handleChop(
   ];
 
   if ((players[seat]?.hand.length ?? 0) === 0) {
-    const finished = finishGame(updated, seat);
-    events.push({ type: 'gameOver', ranking: finished.ranking });
-    return { state: finished, events, error: null };
+    const finished = finalizeRanking(recordFinish(updated, seat), events);
+    if (finished.phase === 'finished') return { state: finished, events, error: null };
+    return { state: advanceFrom(finished, seat, events), events, error: null };
   }
 
   const nextWindow = openChopWindow(updated, combo, cards, seat, actionId, nowMs);
@@ -970,10 +1085,57 @@ export function applyTimeout(state: GameState, options: TimeoutOptions = {}): Ap
   ) {
     return failure(state, 'TURN_PAUSED', 'timer tạm dừng trong chopWindow', state.turn);
   }
-  if (state.trick.lastPlay) {
-    return handlePass(state, { type: 'pass', seat: state.turn, auto: true }, nowMs);
+
+  // §1.7: lượt/timeout không bao giờ trỏ vào ghế đã hết bài / đã rời.
+  const events: GameEvent[] = [];
+  let base = state;
+  const turnPlayer = state.players[state.turn];
+  const turnUsable =
+    turnPlayer !== undefined &&
+    isPlayablePlayer(turnPlayer) &&
+    !state.trick.passed.includes(state.turn);
+  if (!turnUsable) {
+    const repaired = finalizeRanking(repairAfterRemoval(state, events), events);
+    if (repaired.phase === 'finished') {
+      return { state: repaired, events, error: null };
+    }
+    if (repaired.turn < 0) {
+      return failure(repaired, 'NOT_IN_GAME', 'không còn ghế nào đánh được', null);
+    }
+    const repairedPlayer = repaired.players[repaired.turn];
+    if (repairedPlayer === undefined || !isPlayablePlayer(repairedPlayer)) {
+      return failure(repaired, 'NOT_IN_GAME', 'không còn ghế nào đánh được', null);
+    }
+    base = repaired;
   }
 
+  if (!base.trick.lastPlay && !timeoutLeadAllowed(base)) {
+    return failure(
+      base,
+      'LEAD_AUTO_DISABLED',
+      'cấu hình không cho auto đánh khi mở vòng',
+      base.turn,
+    );
+  }
+
+  const result = base.trick.lastPlay
+    ? handlePass(base, { type: 'pass', seat: base.turn, auto: true }, nowMs)
+    : autoPlayLowest(base, nowMs);
+  return { state: result.state, events: [...events, ...result.events], error: result.error };
+}
+
+/**
+ * doc-4 §4.2: hết giờ ở lượt dẫn ván ≥ 2 → auto lá thấp nhất (tự do, không ràng buộc 3♠).
+ * Ván 1 giữ luật cũ theo `turn.autoPlayLowestWhenLeading`.
+ */
+function timeoutLeadAllowed(state: GameState): boolean {
+  if (state.firstMoveFree) {
+    return state.rules.firstPlayerSubsequent?.timeoutLeadPlaysLowest !== false;
+  }
+  return state.rules.turn?.autoPlayLowestWhenLeading !== false;
+}
+
+function autoPlayLowest(state: GameState, nowMs: number): ApplyResult {
   const player = state.players[state.turn];
   if (!player) return failure(state, 'NOT_IN_GAME', 'ghế tới lượt không tồn tại', state.turn);
   const lowest = [...player.hand].sort((a, b) => state.order.compare(a, b))[0];
@@ -994,6 +1156,29 @@ export function createGame(options: CreateGameOptions): GameState {
   }
 
   const order = createCardOrder(rules.deck);
+  const roundIndex = options.roundIndex ?? 1;
+  if (!Number.isInteger(roundIndex) || roundIndex < 1) {
+    throw new RangeError(`roundIndex không hợp lệ: ${String(options.roundIndex)}`);
+  }
+  if (
+    options.firstSeat !== undefined &&
+    options.startingPlayerIndex !== undefined &&
+    options.firstSeat !== options.startingPlayerIndex
+  ) {
+    throw new RangeError('firstSeat và startingPlayerIndex mâu thuẫn');
+  }
+  const forcedSeat = options.firstSeat ?? options.startingPlayerIndex;
+  if (
+    forcedSeat !== undefined &&
+    (!Number.isInteger(forcedSeat) || forcedSeat < 0 || forcedSeat >= players)
+  ) {
+    throw new RangeError(`firstSeat không hợp lệ: ${String(forcedSeat)}`);
+  }
+  // doc-4 §4.2: ván ≥ 2 mới được đánh tự do; ván 1 giữ ràng buộc 3♠.
+  const firstMoveFree =
+    options.firstMoveFree ??
+    (roundIndex >= 2 ? (rules.firstPlayerSubsequent?.firstMoveFree ?? true) : false);
+
   let hands: Card[][];
   let startingPlayerIndex: number;
   let firstMustContain3S: boolean;
@@ -1018,13 +1203,9 @@ export function createGame(options: CreateGameOptions): GameState {
         seen.add(card.id);
       }
     }
-    if (options.startingPlayerIndex !== undefined) {
-      const start = options.startingPlayerIndex;
-      if (!Number.isInteger(start) || start < 0 || start >= players) {
-        throw new RangeError(`startingPlayerIndex không hợp lệ: ${String(start)}`);
-      }
-      startingPlayerIndex = start;
-      const hand = hands[start] ?? [];
+    if (forcedSeat !== undefined) {
+      startingPlayerIndex = forcedSeat;
+      const hand = hands[forcedSeat] ?? [];
       firstMustContain3S = rules.firstPlayer.mustContain3S && containsPrimary(hand, rules.firstPlayer);
     } else {
       const resolved = resolveStartingPlayer(hands, order, rules.firstPlayer);
@@ -1045,7 +1226,15 @@ export function createGame(options: CreateGameOptions): GameState {
     hands = dealt.hands.map((hand) => [...hand]);
     startingPlayerIndex = dealt.startingPlayerIndex;
     firstMustContain3S = dealt.firstMustContain3S;
+    // `startingPlayerIndex` cũ chỉ có tác dụng ở chế độ hands; `firstSeat` áp cho cả ván chia thật.
+    if (options.firstSeat !== undefined) {
+      startingPlayerIndex = options.firstSeat;
+      firstMustContain3S =
+        rules.firstPlayer.mustContain3S &&
+        containsPrimary(hands[options.firstSeat] ?? [], rules.firstPlayer);
+    }
   }
+  if (firstMoveFree) firstMustContain3S = false;
 
   const playerStates: GamePlayer[] = hands.map((hand, seat) => ({
     seat,
@@ -1063,6 +1252,8 @@ export function createGame(options: CreateGameOptions): GameState {
     turn: startingPlayerIndex,
     startingPlayerIndex,
     firstMustContain3S,
+    firstMoveFree,
+    roundIndex,
     firstPlayDone: false,
     trick: { id: 0, leader: startingPlayerIndex, lastPlay: null, passed: [], playCount: 0 },
     ranking: [],

@@ -37,6 +37,11 @@ const PLACE_LABELS: Readonly<Record<RankingView['place'], string>> = {
   bet: 'Bét',
 };
 
+/** Nhãn hạng dùng chung cho badge trên ghế và màn kết quả. */
+export function formatPlace(place: RankingView['place']): string {
+  return PLACE_LABELS[place] ?? 'Không rõ';
+}
+
 const EVENT_LABELS: Readonly<Record<ScoreEventType, string>> = {
   place: 'Hạng',
   toiTrang: 'Tới trắng',
@@ -85,6 +90,21 @@ export function formatPoints(points: number): string {
   return points > 0 ? `+${points}` : String(points);
 }
 
+export function buildBreakdownItems(
+  breakdown: readonly BreakdownEntry[] | null,
+  seat: number,
+): readonly BreakdownItem[] {
+  const lines: BreakdownItem[] = [];
+  for (const item of breakdown ?? []) {
+    const label = EVENT_LABELS[item.type];
+    if (item.to === seat) lines.push({ label, points: item.points });
+    if (item.from === seat && item.from !== item.to) {
+      lines.push({ label, points: -item.points });
+    }
+  }
+  return lines;
+}
+
 export function buildResultRows(
   ranking: readonly RankingView[],
   scores: readonly number[],
@@ -92,14 +112,7 @@ export function buildResultRows(
   breakdown: readonly BreakdownEntry[] | null,
 ): readonly ResultRow[] {
   return ranking.map((entry) => {
-    const lines: BreakdownItem[] = [];
-    for (const item of breakdown ?? []) {
-      const label = EVENT_LABELS[item.type];
-      if (item.to === entry.seat) lines.push({ label, points: item.points });
-      if (item.from === entry.seat && item.from !== item.to) {
-        lines.push({ label, points: -item.points });
-      }
-    }
+    const lines = [...buildBreakdownItems(breakdown, entry.seat)];
     const total = scores[entry.seat] ?? lines.reduce((sum, line) => sum + line.points, 0);
     return {
       seat: entry.seat,

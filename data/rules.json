@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "rulesVersion": "1.2.0",
-  "sourceDoc": "doc-2 rev4 (task-12) - ruleset Tiến Lên Miền Nam M1",
+  "rulesVersion": "1.5.0",
+  "sourceDoc": "doc-3 rev6 (TASK-26, 2026-11-04) + doc-4 §T tour nhieu van (TASK-28, 2026-11-04)",
   "deck": {
     "cardCount": 52,
     "ranks": ["3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A", "2"],
@@ -44,7 +44,37 @@
     "fallbackSuits": ["clubs", "diamonds", "hearts"],
     "fallbackRule": "lowestCard",
     "rejectCode": "FIRST_MUST_CONTAIN_3S",
-    "note": "Người giữ 3♠ đi trước và lượt đầu bắt buộc đánh bộ chứa 3♠. Nếu 3♠ nằm trong bài dư: xét 3♣ → 3♦ → 3♥ → lá thấp nhất; lượt đầu đánh tự do."
+    "note": "VAN 1 CUA TOUR: người giữ 3♠ đi trước và lượt đầu bắt buộc đánh bộ chứa 3♠. Nếu 3♠ nằm trong bài dư: xét 3♣ → 3♦ → 3♥ → lá thấp nhất; lượt đầu đánh tự do. Từ ván 2 áp dụng firstPlayerSubsequent.",
+    "appliesTo": "round1Only"
+  },
+  "firstPlayerSubsequent": {
+    "winnerLeads": true,
+    "firstMoveFree": true,
+    "fallback": "highestPlacedPresent",
+    "fallbackOrder": ["nhi", "ba", "bet"],
+    "newSeatLast": true,
+    "emptyFallback": "seat0",
+    "timeoutLeadPlaysLowest": true,
+    "rejectCode": null,
+    "appliesTo": "round2Plus",
+    "note": "VAN 2+ CUA TOUR (doc-4 §T.1): người hạng Nhất ván trước đi trước, lượt đầu đánh tự do (bỏ ràng buộc 3♠, bỏ auto lá nhỏ nhất). Tới trắng vẫn xét trước như cũ. Nhất đã rời → hạng cao nhất còn trong phòng (Nhì → Ba → Bét); ghế mới vào giữa tour xếp sau cùng; không còn hạng nào → ghế seat 0. Hết giờ ở lượt dẫn → auto lá thấp nhất (tự do)."
+  },
+  "tour": {
+    "allowedCounts": [10, 20, 40],
+    "min": 2,
+    "max": 99,
+    "defaultCount": 10,
+    "resultDisplayMs": 10000,
+    "autoNext": true,
+    "requireReady": false,
+    "allowSkip": false,
+    "minPlayersToStart": 2,
+    "resumeCountdownMs": 3000,
+    "afkKickConsecutiveRounds": 3,
+    "earlyEndByHost": true,
+    "allowMidJoin": false,
+    "tourTieBreak": ["pointsTotal", "wins", "leastPaidThoiDen", "seatOrder"],
+    "note": "Tour nhieu van doc-4 (TASK-28, user chot 2026-11-04): het van hien bang diem 10s roi TU DONG chia van moi cung phong/ghe, khong ready, khong skip; du N van hien bang tong ket cuoi tour; thieu 2 nguoi thi TAM DUNG. User chot 2026-11-05: allowMidJoin=false - tour dang chay (running/betweenRounds/paused) thi khong nhan nguoi moi vao ghe trong; nguoi da co ghe van reconnect binh thuong."
   },
   "variants": [
     { "id": "V1", "key": "toiTrang", "status": "enabled", "note": "Bật 5 tổ hợp tới trắng §2.2" },
@@ -54,7 +84,7 @@
     { "id": "V5", "key": "thoiHaiThoiHang", "status": "enabled", "note": "Phạt thối 2 và thối hàng" },
     { "id": "V6", "key": "haiVeCuoi", "status": "allowedNoPenalty", "note": "2 về cuối được phép, không phạt" },
     { "id": "V7", "key": "baBichCuoi", "status": "disabled", "note": "3♠ về cuối không thưởng" },
-    { "id": "V8", "key": "denBai", "status": "enabled", "note": "Đền 13 lá + DEN-2 chặt chồng §2.3 (rev 4 bỏ DEN-1/DEN-3)" },
+    { "id": "V8", "key": "denBai", "status": "enabled", "note": "Đền 13 lá = ra khỏi ván, không hạng, không thối, trả Nhất §2.3 + DEN-2 chặt chồng cộng dồn pot rev6 (rev 4 bỏ DEN-1/DEN-3)" },
     { "id": "V9", "key": "sanhChuaHai", "status": "forbidden", "note": "Cấm sảnh chứa 2 và A-2-3" },
     { "id": "V10", "key": "van2to3Nguoi", "status": "sameAs4", "note": "Ván 2-3 người đánh giống hệt 4 người" }
   ],
@@ -139,8 +169,11 @@
     "enabled": true,
     "pointsRef": "scoring.den.giu13La",
     "chatChongGanhChuoi": true,
-    "chatChongTheoGiaTriMucTieu": true,
-    "note": "Đền 13 lá: người còn đủ 13 lá trả Nhất 4 + tổng giá trị heo/hàng trên tay, không tính thối riêng. DEN-2 chặt chồng: revert khoản chặt lẻ, chỉ đền giá trị mục tiêu ĐẦU chuỗi (không cộng dồn). DEN-1/DEN-3 đã bỏ từ rev 4."
+    "chatChongCongDon": true,
+    "chatChongTheoGiaTriMucTieu": false,
+    "denLaKhoanRiengTraNhat": true,
+    "denKhongTaoHang": true,
+    "note": "Đền 13 lá rev6: ghế còn đủ 13 lá lúc có Nhất ra khỏi ván ngay, KHÔNG xếp hạng, không bị thối; trả Nhất 4 + tổng giá trị heo/hàng trên tay. DEN-2 chặt chồng rev6: pot cộng dồn = tổng giá trị tất cả nước trong chuỗi trừ nước của người thắng chuỗi; người bị chặt cuối trả toàn bộ pot cho người thắng chuỗi; các ghế trước trả 0. Quy tắc cũ (revert về 0, chỉ đền giá trị mục tiêu đầu chuỗi) đã bỏ. DEN-1/DEN-3 đã bỏ từ rev 4."
   },
   "sanhChuaHai": false,
   "chatNgoaiLuot": {
@@ -161,17 +194,25 @@
       "heoDo": 2,
       "baDoiThong": 3,
       "tuQuy": 4,
-      "bonDoiThong": 6
+      "bonDoiThong": 5
+    },
+    "thoi": {
+      "enabled": true,
+      "to": "nearestBelowBet",
+      "rule": "hangThapNhatConTonTaiNgoaiTruBetVaChinhMinh",
+      "fallbackToNhat": true,
+      "note": "Thối trả hạng GẦN BÉT NHẤT còn tồn tại (rev6): 4 người đủ hạng → Ba; 4 người thiếu Ba → Nhì; 3 người → Nhì; 2 người → Nhất. Người đền KHÔNG bị thối."
     },
     "den": { "giu13La": 4 },
     "haiVeCuoi": 0,
     "baBichCuoi": 0,
-    "note": "Hạng cộng dồn từ tour chung: 4 người 3/2/1/0 (tổng 6), 3 người 3/2/0 (tổng 5), 2 người 3/0 (tổng 3); không zero-sum, không dồn lệch. Tới trắng +6. Chặt/thối/đền là chuyển điểm theo bảng values. Bảng cũ 5/6/8/10/12 và 10/nhà đã bỏ."
+    "note": "Hạng cộng dồn từ tour chung: 4 người 3/2/1/0 (tổng 6), 3 người 3/2/0 (tổng 5), 2 người 3/0 (tổng 3); không zero-sum, không dồn lệch. Tới trắng +6. Chặt/thối/đền là chuyển điểm theo bảng values, quyết toán cuối ván. Tổng ván 4 người theo số người đền (rev6): 0→6, 1→6 (Nhất/Nhì/Ba), 2→5 (Nhất/Nhì), 3→3 (chỉ Nhất). Người đền ra khỏi ván, không hạng; khoản đền chỉ Nhất nhận. Bảng cũ 4ĐT=6, revert-về-0, thối-trả-Nhất đã bỏ."
   },
   "turn": {
     "turnTimerMs": 25000,
     "countdownWarnMs": 10000,
     "autoPassWhenMidTrick": true,
-    "autoPlayLowestWhenLeading": true
+    "autoPlayLowestWhenLeading": true,
+    "note": "autoPlayLowestWhenLeading áp ràng buộc 3♠ ở lượt đầu ván 1; từ ván 2 áp firstPlayerSubsequent.timeoutLeadPlaysLowest (auto lá thấp nhất, tự do)."
   }
 }

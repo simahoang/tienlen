@@ -1,5 +1,5 @@
 import type { CardOrder } from './deck';
-import type { GameHistoryEntry, GameState } from './game';
+import type { GameHistoryEntry, GameState, Place } from './game';
 import type { Card, Rank, Suit } from './types';
 
 export type ScoreEventType =
@@ -52,8 +52,9 @@ function applyTransfer(
 }
 
 /**
- * §2.4 thối: mỗi heo còn tay = giá trị lá (đen 1 / đỏ 2); mỗi hàng còn tay
- * = 3ĐT 3 / TQ 4 / 4ĐT 6. Tứ quý heo đã tính theo từng lá 2, không cộng thêm TQ.
+ * §2.4 rev6 thối: mỗi heo còn tay = giá trị lá (đen 1 / đỏ 2); mỗi hàng còn tay
+ * = 3ĐT 3 / TQ 4 / 4ĐT 5 (đọc từ rules.json). Tứ quý heo đã tính theo từng lá 2,
+ * không cộng thêm TQ.
  */
 export function thoiPoints(
   hand: readonly Card[],
@@ -117,14 +118,35 @@ function chopChains(history: readonly GameHistoryEntry[]): Extract<GameHistoryEn
   return chains;
 }
 
+/** Thứ tự hạng cao → thấp, dùng cho "hạng gần Bét nhất". */
+const PLACE_ORDER: readonly Place[] = ['nhat', 'nhi', 'ba', 'bet'];
+
+function placeOrderIndex(place: Place): number {
+  return PLACE_ORDER.indexOf(place);
+}
+
 /**
- * §2.4 (rulesVersion 1.2.0):
+ * §2.4 rev6 bảng thối: người thối trả cho hạng thấp nhất còn tồn tại, ngoại trừ
+ * Bét và ngoại trừ chính mình; không còn hạng nào thỏa → Nhất.
+ */
+export function thoiRecipient(state: GameState, payer: number): number | null {
+  const candidates = state.ranking
+    .filter((entry) => entry.place !== 'bet' && entry.seat !== payer)
+    .sort((a, b) => placeOrderIndex(b.place) - placeOrderIndex(a.place));
+  const lowest = candidates[0];
+  if (lowest) return lowest.seat;
+  const nhat = state.ranking.find((entry) => entry.place === 'nhat');
+  return nhat?.seat ?? null;
+}
+
+/**
+ * §2.4 (rulesVersion 1.4.0 / doc-3 rev6):
  * - Hạng cộng dồn từ tour chung theo số người, KHÔNG zero-sum, không dồn lệch.
  * - Tới trắng +6, ván dừng, các nhà còn lại 0 hạng.
- * - Chặt = giá trị mục tiêu; chặt chồng (DEN-2) quyết toán ròng bằng giá trị
- *   mục tiêu ĐẦU chuỗi.
- * - Thối theo bảng giá trị; đền 13 lá = 4 + tổng giá trị heo/hàng trên tay,
- *   người đền không tính thối riêng.
+ * - Chặt = giá trị mục tiêu; chặt chồng (DEN-2) = pot CỘNG DỒN mọi nước trong
+ *   chuỗi, người bị chặt cuối trả toàn bộ pot cho người thắng chuỗi.
+ * - Thối theo bảng giá trị, trả hạng gần Bét nhất còn tồn tại.
+ * - Đền 13 lá = 4 + tổng giá trị heo/hàng trên tay, người đền không thối riêng.
  */
 export function calculateScore(state: GameState): ScoreResult {
   if (state.phase !== 'finished') {
@@ -163,9 +185,10 @@ export function calculateScore(state: GameState): ScoreResult {
     return { deltas, breakdown, toiTrang: false };
   }
 
-  // Chặt + chặt chồng: chuỗi >= 2 khoản → DEN-2 ròng, chỉ đền giá trị mục tiêu đầu chuỗi.
+  // Chặt + chặt chồng: chuỗi >= 2 khoản → DEN-2 pot cộng dồn (rev6).
   const denBai = state.rules.denBai;
   const chainGanh = denBai?.chatChongGanhChuoi ?? true;
+  const congDon = denBai?.chatChongCongDon ?? true;
   for (const chain of chopChains(state.history)) {
     const first = chain[0];
     const last = chain[chain.length - 1];
@@ -187,11 +210,14 @@ export function calculateScore(state: GameState): ScoreResult {
       }
       continue;
     }
-    const theoGiaTriDauChuoi = denBai?.chatChongTheoGiaTriMucTieu ?? true;
-    const points = theoGiaTriDauChuoi
-      ? (first.points ?? 0)
-      : chain.reduce((sum, entry) => sum + (entry.points ?? 0), 0);
-    applyTransfer(deltas, breakdown, first.seat, last.seat, points, 'chatChong', 'chặt chồng (DEN-2)');
+    // pot = tổng giá trị mọi nước trong chuỗi (mục tiêu đầu + các hàng dùng để chặt),
+    // trừ nước của người thắng chuỗi; người bị chặt cuối trả toàn bộ pot.
+    const theoMucTieu = denBai?.chatChongTheoGiaTriMucTieu ?? false;
+    const pot =
+      !congDon && theoMucTieu
+        ? (first.points ?? 0)
+        : chain.reduce((sum, entry) => sum + (entry.points ?? 0), 0);
+    applyTransfer(deltas, breakdown, last.targetBy, last.seat, pot, 'chatChong', 'chặt chồng (DEN-2)');
   }
 
   // Đền 13 lá: còn đủ 13 lá khi có Nhất → trả 4 + tổng giá trị heo/hàng trên tay.
@@ -200,7 +226,7 @@ export function calculateScore(state: GameState): ScoreResult {
     const fullHand = state.rules.deal.cardsPerPlayer;
     for (const player of state.players) {
       if (player.seat === winner || player.surrendered) continue;
-      if (player.hand.length !== fullHand) continue;
+      if (player.denOut !== true && player.hand.length !== fullHand) continue;
       const extra = thoiPoints(player.hand, state.order, scoring.values);
       const points = scoring.den.giu13La + extra;
       denSeats.add(player.seat);
@@ -208,12 +234,14 @@ export function calculateScore(state: GameState): ScoreResult {
     }
   }
 
-  // Thối heo/hàng còn tay khi có Nhất; người đền 13 lá không tính thối riêng.
+  // Thối heo/hàng còn tay khi ván kết thúc, trả hạng gần Bét nhất còn tồn tại.
   for (const player of state.players) {
     if (player.seat === winner) continue;
     if (denSeats.has(player.seat)) continue;
     const amount = thoiPoints(player.hand, state.order, scoring.values);
-    applyTransfer(deltas, breakdown, player.seat, winner, amount, 'thoi', 'thối heo/hàng');
+    const to = thoiRecipient(state, player.seat);
+    if (to === null) continue;
+    applyTransfer(deltas, breakdown, player.seat, to, amount, 'thoi', 'thối heo/hàng');
   }
 
   return { deltas, breakdown, toiTrang: false };

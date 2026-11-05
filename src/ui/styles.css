@@ -393,6 +393,12 @@ h1 {
   color: var(--danger);
 }
 
+.badge--place {
+  background: rgba(242, 193, 78, 0.2);
+  color: var(--accent);
+  font-weight: 700;
+}
+
 .room-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -423,6 +429,7 @@ h1 {
     'name name'
     'badges badges';
   gap: 4px;
+  min-width: 0;
   padding: 10px 12px;
   border-radius: 12px;
   border: 1px solid var(--line);
@@ -442,6 +449,16 @@ h1 {
   opacity: 0.6;
 }
 
+.table-seat--placed {
+  border-style: dashed;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.table-seat--placed .table-seat__name {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
 .table-seat--empty {
   border-style: dashed;
   color: var(--muted);
@@ -457,6 +474,7 @@ h1 {
 
 .table-seat__name {
   grid-area: name;
+  min-width: 0;
   font-weight: 700;
   font-size: 0.95rem;
   overflow-wrap: anywhere;
@@ -522,6 +540,30 @@ h1 {
   color: var(--muted);
   font-size: 0.9rem;
   line-height: 1.6;
+}
+
+/* Người đã chốt hạng nhưng ván còn chơi tiếp */
+.waiting {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px;
+  border: 1px dashed rgba(242, 193, 78, 0.45);
+  border-radius: 12px;
+  background: rgba(242, 193, 78, 0.08);
+  text-align: center;
+}
+
+.waiting__title {
+  margin: 0;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.waiting__hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
 }
 
 .card-mini {
@@ -964,4 +1006,368 @@ h1 {
   .toast {
     transition: none;
   }
+}
+
+/* Tour nhi?u v�n (doc-4 �8): ch?n s? v�n, d?m ngu?c, t?ng k?t, d?n 13 l� */
+.pill--tour {
+  border-color: rgba(242, 193, 78, 0.45);
+  color: var(--accent);
+}
+
+.tour-count {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tour-count legend {
+  padding: 0;
+  margin-bottom: 6px;
+}
+
+.tour-count__hint {
+  margin: 0;
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.segmented__btn {
+  min-height: 44px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.segmented__btn--active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.field--compact {
+  margin-top: 2px;
+}
+
+.round-banner {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 4px 10px;
+  padding: 8px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(242, 193, 78, 0.4);
+  background: rgba(242, 193, 78, 0.1);
+  font-size: 0.78rem;
+}
+
+.round-banner__round {
+  color: var(--muted);
+}
+
+.round-banner__first {
+  font-weight: 700;
+}
+
+.round-banner__free {
+  color: var(--ok);
+}
+
+.den-banner {
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 180, 162, 0.45);
+  background: rgba(255, 180, 162, 0.12);
+  color: var(--danger);
+  font-size: 0.82rem;
+  text-align: center;
+}
+
+.table-seat--den {
+  border-color: rgba(255, 180, 162, 0.5);
+  border-style: dashed;
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.table-seat--den .table-seat__name {
+  color: var(--muted);
+}
+
+.badge--den {
+  background: rgba(255, 180, 162, 0.2);
+  color: var(--danger);
+}
+
+.badge--den-points {
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.tour-overlay__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.tour-round-header,
+.tour-round-row {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 56px 64px;
+  gap: 8px;
+  align-items: center;
+}
+
+.tour-round-header {
+  padding: 0 10px;
+  color: var(--muted);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.tour-round-header__round,
+.tour-round-header__total {
+  text-align: right;
+}
+
+.tour-round-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tour-round-row {
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  background: var(--panel);
+  font-size: 0.88rem;
+}
+
+.tour-round-row--you {
+  border-color: rgba(242, 193, 78, 0.6);
+  background: rgba(242, 193, 78, 0.1);
+}
+
+.tour-round-row__name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.tour-round-row__round,
+.tour-round-row__total {
+  text-align: right;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.tour-round-row__total {
+  color: var(--accent);
+}
+
+.tour-round-row__meta {
+  grid-column: 2 / -1;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.tour-countdown {
+  margin: 0;
+  text-align: center;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.tour-countdown[data-level='done'] {
+  color: var(--ok);
+}
+
+.tour-next-leader,
+.tour-first-free {
+  margin: 0;
+  text-align: center;
+  font-size: 0.85rem;
+}
+
+.tour-next-leader {
+  font-weight: 700;
+}
+
+.tour-first-free {
+  color: var(--ok);
+}
+
+.tour-paused__reason {
+  margin: 0;
+  text-align: center;
+  font-weight: 700;
+}
+
+.result-overlay__actions .btn {
+  min-height: 44px;
+}
+
+/* B?ng t?ng k?t cu?i tour: full-screen cu?n d?c 1 tay tr�n mobile */
+.result-overlay.tour-summary {
+  align-items: stretch;
+  padding: 0;
+}
+
+.result-overlay.tour-summary .result-overlay__card {
+  width: min(100%, 760px);
+  height: 100dvh;
+  max-height: 100dvh;
+  border-radius: 0;
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 12px);
+}
+
+.tour-summary__rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tour-summary__row {
+  min-width: 0;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.tour-summary__row--you {
+  border-color: var(--accent);
+}
+
+.tour-summary__row-head {
+  display: flex;
+  align-items: center;
+  gap: 6px 10px;
+  flex-wrap: wrap;
+}
+
+.tour-summary__name {
+  flex: 1 1 120px;
+  min-width: 0;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.tour-summary__points {
+  color: var(--accent);
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.tour-summary__rank,
+.tour-summary__flag {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.tour-summary__flag--left {
+  color: var(--danger);
+}
+
+.tour-summary__details {
+  display: grid;
+  grid-template-columns: auto 1fr auto 1fr;
+  gap: 2px 8px;
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.tour-summary__details dt,
+.tour-summary__details dd {
+  margin: 0;
+}
+
+.tour-summary__details dd {
+  text-align: right;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.tour-summary__early {
+  margin: 0;
+  color: var(--danger);
+  font-weight: 700;
+}
+
+.tour-summary__you {
+  margin: 0;
+  text-align: center;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.tour-summary__actions {
+  position: sticky;
+  bottom: 0;
+  display: grid;
+  gap: 8px;
+  padding-top: 8px;
+  background: linear-gradient(180deg, transparent, #0f2f25 32%);
+}
+
+.tour-summary__actions .btn {
+  min-height: 48px;
+}
+
+@media (min-width: 600px) {
+  .tour-summary__actions {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (min-width: 900px) {
+  .result-overlay.tour-summary {
+    align-items: center;
+    padding: 24px;
+  }
+
+  .result-overlay.tour-summary .result-overlay__card {
+    height: auto;
+    max-height: 90dvh;
+    border-radius: 18px;
+  }
+
+  .tour-summary__rows {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-content: start;
+  }
+}
+
+.tour-round-row__lines {
+  grid-column: 2 / -1;
+  list-style: none;
+  margin: 2px 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  color: var(--muted);
+  font-size: 0.7rem;
 }

@@ -63,6 +63,12 @@ function isYourTurn(state: PublicGameState, youSeat: number): boolean {
   return state.phase === 'playing' && state.turn === youSeat && state.chopWindow === null;
 }
 
+/** Ghế của bạn đã chốt hạng/đã rời ván → không còn quyền đánh, bỏ lượt hay xin hàng. */
+function isSelfPlaced(state: PublicGameState, youSeat: number): boolean {
+  const self = state.players.find((player) => player.seat === youSeat);
+  return self?.placed === true;
+}
+
 export function evaluateSelection(
   hand: readonly CardView[],
   selectedIds: ReadonlySet<string>,
@@ -74,6 +80,9 @@ export function evaluateSelection(
 
   if (state === null || state.phase !== 'playing') {
     return { selected, combo, playable: false, hint: 'Ván chưa bắt đầu hoặc đã kết thúc.' };
+  }
+  if (isSelfPlaced(state, youSeat)) {
+    return { selected, combo, playable: false, hint: 'Bạn đã về, chờ ván kết thúc.' };
   }
   if (state.chopWindow !== null) {
     return { selected, combo, playable: false, hint: 'Cửa sổ chặt đang mở.' };
@@ -116,7 +125,7 @@ export function canPassTurn(state: PublicGameState | null, youSeat: number): boo
 export function canSurrender(state: PublicGameState | null, youSeat: number): boolean {
   if (state === null || state.phase !== 'playing') return false;
   const self = state.players.find((player) => player.seat === youSeat);
-  return self !== undefined && !self.surrendered;
+  return self !== undefined && !self.surrendered && self.placed !== true;
 }
 
 /** Server từ chối intent chặt (WINDOW_CLOSED/LOST_RACE/...) thì mở khoá nút để bấm lại. */

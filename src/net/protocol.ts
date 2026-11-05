@@ -1,3 +1,4 @@
+import { rules } from '../data/index';
 import type { ComboKey, Rank, Suit } from '../rules/types';
 
 /**
@@ -34,11 +35,89 @@ export interface RoomView {
   readonly maxSeats: number;
   readonly phase: RoomPhase;
   readonly players: readonly RoomPlayerView[];
+  /** Thông tin tour của phòng; vắng mặt = phòng chưa mở tour (lobby cũ). */
+  readonly tour?: TourView;
   /** Chỉ có ý nghĩa với người nhận message; token dùng cho reconnect (pha 2). */
   readonly you: { readonly seat: number; readonly token: string };
 }
 
 export type RoomPhase = 'lobby' | 'playing' | 'finished';
+
+/** doc-4 §3: vòng đời tour trong phòng. `betweenRounds` = KET_QUA_VAN đang đếm ngược. */
+export type TourPhase = 'running' | 'betweenRounds' | 'paused' | 'finished';
+
+export interface TourView {
+  readonly tourId: string;
+  /** Tổng số ván của tour (N). */
+  readonly soVan: number;
+  /** Ván hiện tại/đã chơi xong gần nhất, 1..N. */
+  readonly roundIndex: number;
+  readonly phase: TourPhase;
+  /** Mốc auto chia ván mới (epoch ms) khi phase `betweenRounds`; null nếu không hẹn. */
+  readonly nextRoundAt: number | null;
+  /** true khi tour kết thúc sớm (chủ phòng dừng) — bảng tổng kết gắn cờ này. */
+  readonly incomplete?: boolean;
+}
+
+export type TourRankPlace = 'nhat' | 'nhi' | 'ba' | 'bet';
+
+/** Một hàng điểm tour (doc-4 §5.2). `place` là hạng ván vừa rồi (null nếu không xếp hạng). */
+export interface TourScoreView {
+  readonly seat: number;
+  readonly nickname: string;
+  readonly pointsTotal: number;
+  /** Điểm ván vừa kết thúc (0 nếu người chơi không có mặt ván đó). */
+  readonly roundPoints: number;
+  readonly wins: number;
+  readonly chatThu: number;
+  readonly chatTra: number;
+  /** chatThu − chatTra (gồm chặt chồng). */
+  readonly netChat: number;
+  readonly thoiTra: number;
+  readonly denTra: number;
+  readonly roundsPlayed: number;
+  readonly joinedMid: boolean;
+  readonly left: boolean;
+  readonly lastPlace: TourRankPlace | null;
+}
+
+/** Bảng điểm sau mỗi ván + hẹn giờ chia ván kế (doc-4 §3.1). */
+export interface TourResultView {
+  readonly tourId: string;
+  readonly roundIndex: number;
+  readonly soVan: number;
+  /** Ván kế tiếp (null khi vừa chơi ván cuối). */
+  readonly nextRoundIndex: number | null;
+  readonly nextRoundAt: number | null;
+  /** Ghế đi trước ván kế (dự đoán theo ghế hiện tại; null khi hết tour). */
+  readonly nextFirstSeat: number | null;
+  readonly nextFirstNickname: string | null;
+  readonly nextFirstMoveFree: boolean;
+  readonly scores: readonly TourScoreView[];
+}
+
+/** Một hàng bảng tổng kết cuối tour, đã xếp hạng theo doc-4 §5.3. */
+export interface TourEndRowView extends TourScoreView {
+  readonly tourRank: number;
+  readonly tourPlace: TourRankPlace;
+}
+
+export interface TourEndView {
+  readonly tourId: string;
+  readonly soVan: number;
+  readonly roundsPlayed: number;
+  readonly incomplete: boolean;
+  readonly rows: readonly TourEndRowView[];
+}
+
+/** doc-4 §6: TAM_DUNG khi thiếu người để chia ván mới. */
+export interface TourPausedView {
+  readonly tourId: string;
+  readonly roundIndex: number;
+  readonly present: number;
+  readonly needed: number;
+  readonly reason: 'thieu_nguoi';
+}
 
 export interface StatePlayerView {
   readonly seat: number;
@@ -47,6 +126,27 @@ export interface StatePlayerView {
   readonly ready: boolean;
   readonly connected: boolean;
   readonly surrendered: boolean;
+  /**
+   * true khi ghế đã chốt hạng (về Nhất/Nhì/Ba/Bét hoặc đã rời ván) — có thể xảy ra
+   * ngay trong phase `playing` khi ván còn chơi tiếp. Vắng mặt = client cũ, hiểu là chưa về.
+   */
+  readonly placed?: boolean;
+  /**
+   * rev6 §1.7: ghế giữ đủ 13 lá khi đã có Nhất → ra khỏi ván ngay, không có hạng,
+   * không bị thối, không còn lượt. Vắng mặt = client cũ, hiểu là chưa đền.
+   */
+  readonly denOut?: boolean;
+}
+
+/** Lý do ghế rời ván vì đền bài; M1 chỉ có giữ đủ 13 lá. */
+export type DenBaiReason = 'GIU_13_LA';
+
+/** Một lần đền 13 lá: `who` trả `points` cho `to` (người về Nhất). */
+export interface DenBaiView {
+  readonly who: number;
+  readonly to: number;
+  readonly points: number;
+  readonly reason: DenBaiReason;
 }
 
 export interface TableView {
@@ -98,18 +198,34 @@ export interface PublicGameState {
   readonly players: readonly StatePlayerView[];
   readonly table: TableView | null;
   readonly trick: { readonly id: number; readonly leader: number; readonly passed: readonly number[] };
+  /**
+   * Hạng đã chốt, sắp từ Nhất xuống Bét. Khi phase `playing` mảng có thể rỗng hoặc
+   * thiếu ghế (ai chưa về thì chưa có entry); chỉ đủ hạng khi phase `finished`.
+   * `null` = chưa có ván nào.
+   */
   readonly ranking: readonly RankingView[] | null;
   readonly scores: readonly number[] | null;
   /** Chỉ có khi phase finished; vắng mặt hoàn toàn khi đang chơi. */
   readonly breakdown?: readonly ScoreBreakdownView[];
+  /**
+   * Các ghế đã đền 13 lá (đang chơi hoặc đã xong), kèm điểm trừ theo đúng công thức
+   * engine. Dùng cho reconnect/UI; vắng mặt = chưa có ai đền (client cũ vẫn chạy).
+   */
+  readonly denBai?: readonly DenBaiView[];
   readonly turnDeadline: number | null;
   readonly chopWindow: ChopWindowView | null;
   readonly lastActionId: string | null;
+  /** Ván thứ mấy trong tour (1..N); vắng mặt = client cũ / ván đơn. */
+  readonly roundIndex?: number;
+  /** true khi lượt đầu ván được đánh tự do (ván ≥ 2 của tour, doc-4 §4.2). */
+  readonly firstMoveFree?: boolean;
+  /** Ghế đi trước ván này; vắng mặt = client cũ. */
+  readonly firstSeat?: number;
   readonly serverNow: number;
 }
 
 export type ClientMessage =
-  | { readonly t: 'createRoom'; readonly nickname: string }
+  | { readonly t: 'createRoom'; readonly nickname: string; readonly soVan?: number }
   | { readonly t: 'joinRoom'; readonly code: string; readonly nickname: string }
   | { readonly t: 'ready'; readonly ready: boolean }
   | { readonly t: 'start' }
@@ -117,6 +233,12 @@ export type ClientMessage =
   | { readonly t: 'pass' }
   | { readonly t: 'surrender' }
   | { readonly t: 'chop'; readonly cards: readonly string[]; readonly targetActionId: string }
+  /** Rời tour: bỏ điểm tour, trả ghế trống ngay (doc-4 §5.4). */
+  | { readonly t: 'leaveTour' }
+  /** Chủ phòng kết thúc sớm tour đang chạy (doc-4 §3.1). */
+  | { readonly t: 'endTour' }
+  /** Tour mới cùng ghế: tour_id mới, điểm từ 0. */
+  | { readonly t: 'newTour'; readonly soVan?: number }
   | { readonly t: 'reconnect'; readonly token: string };
 
 export type ServerMessage =
@@ -128,6 +250,20 @@ export type ServerMessage =
       /** Chỉ gửi kèm khi reconnect (§3.2): log công khai từ đầu ván. */
       readonly actionLog?: readonly ActionLogView[];
     }
+  | {
+      /** Một ghế vừa bị chốt đền (rev6 §1.7); broadcast ngay cho cả phòng. */
+      readonly t: 'denBai';
+      readonly event: DenBaiView;
+      readonly serverNow: number;
+    }
+  | {
+      /** Ván vừa quyết toán: bảng điểm ván + điểm tour cộng dồn + hẹn 10s. */
+      readonly t: 'tourResult';
+      readonly result: TourResultView;
+      readonly serverNow: number;
+    }
+  | { readonly t: 'tourPaused'; readonly paused: TourPausedView; readonly serverNow: number }
+  | { readonly t: 'tourEnd'; readonly summary: TourEndView; readonly serverNow: number }
   | { readonly t: 'error'; readonly code: string; readonly message: string };
 
 export type ParseResult =
@@ -172,6 +308,20 @@ function parseCardIds(value: unknown): string[] | null {
   return cards;
 }
 
+/** `null` = không gửi (dùng mặc định); `'invalid'` = sai kiểu/khoảng (trả lỗi rõ ràng). */
+function parseTourCount(value: unknown): number | null | 'invalid' {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'number' || !Number.isInteger(value)) return 'invalid';
+  const { min, max } = rules.tour;
+  if (value < min || value > max) return 'invalid';
+  return value;
+}
+
+export function tourCountError(): string {
+  const { min, max } = rules.tour;
+  return `số ván phải là số nguyên từ ${min} đến ${max}`;
+}
+
 /** Validate thủ công (không thêm dependency): từ chối payload lạ, sai kiểu, sai shape. */
 export function parseClientMessage(raw: string): ParseResult {
   let parsed: unknown;
@@ -187,7 +337,17 @@ export function parseClientMessage(raw: string): ParseResult {
     case 'createRoom': {
       const nickname = parseNickname(parsed['nickname']);
       if (!nickname) return fail('INVALID_NICKNAME', `nickname phải 1-${NICKNAME_MAX} ký tự`);
-      return { ok: true, message: { t: 'createRoom', nickname } };
+      const soVan = parseTourCount(parsed['soVan']);
+      if (soVan === 'invalid') return fail('INVALID_TOUR_COUNT', tourCountError());
+      return {
+        ok: true,
+        message: { t: 'createRoom', nickname, ...(soVan === null ? {} : { soVan }) },
+      };
+    }
+    case 'newTour': {
+      const soVan = parseTourCount(parsed['soVan']);
+      if (soVan === 'invalid') return fail('INVALID_TOUR_COUNT', tourCountError());
+      return { ok: true, message: { t: 'newTour', ...(soVan === null ? {} : { soVan }) } };
     }
     case 'joinRoom': {
       const code = parseRoomCode(parsed['code']);
@@ -212,6 +372,10 @@ export function parseClientMessage(raw: string): ParseResult {
       return { ok: true, message: { t: 'pass' } };
     case 'surrender':
       return { ok: true, message: { t: 'surrender' } };
+    case 'leaveTour':
+      return { ok: true, message: { t: 'leaveTour' } };
+    case 'endTour':
+      return { ok: true, message: { t: 'endTour' } };
     case 'chop': {
       const cards = parseCardIds(parsed['cards']);
       if (!cards) return fail('INVALID_CARDS', 'cards phải là 1-13 card id duy nhất');

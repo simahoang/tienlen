@@ -23,6 +23,12 @@ export interface StartServerOptions {
   readonly rateWindowMs?: number;
   /** TTL dọn phòng finished khi hết người kết nối (ms), mặc định 600000. */
   readonly roomTtlMs?: number;
+  /** Hiện bảng điểm ván trước khi auto chia ván mới (ms), mặc định rules.tour.resultDisplayMs. */
+  readonly tourResultDisplayMs?: number;
+  /** Đếm ngược resume tour từ TAM_DUNG (ms), mặc định rules.tour.resumeCountdownMs. */
+  readonly tourResumeMs?: number;
+  /** Số người tối thiểu để chia ván, mặc định rules.tour.minPlayersToStart. */
+  readonly minPlayersToStart?: number;
   /** Giới hạn phòng đồng thời, mặc định 500. */
   readonly maxRooms?: number;
   /** Hook test: seed cố định và/hoặc chia tay thủ công. */
@@ -95,6 +101,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
     rateWindowMs: options.rateWindowMs ?? 1000,
     roomTtlMs: options.roomTtlMs ?? 600000,
     maxRooms: options.maxRooms ?? 500,
+    ...(options.tourResultDisplayMs === undefined
+      ? {}
+      : { tourResultDisplayMs: options.tourResultDisplayMs }),
+    ...(options.tourResumeMs === undefined ? {} : { tourResumeMs: options.tourResumeMs }),
+    ...(options.minPlayersToStart === undefined
+      ? {}
+      : { minPlayersToStart: options.minPlayersToStart }),
     ...(options.logger ? { logger: options.logger } : {}),
     ...(options.seed === undefined ? {} : { seed: options.seed }),
     ...(options.hands ? { hands: options.hands } : {}),

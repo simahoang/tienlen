@@ -29,6 +29,10 @@ export interface ReplayOptions {
   /** Hook test: dựng ván với tay bài cố định thay vì chia từ seed. */
   readonly hands?: readonly (readonly Card[])[];
   readonly startingPlayerIndex?: number;
+  /** doc-4 §4.2: ván ≥ 2 trong tour — ghế đi trước do kết quả ván trước quyết định. */
+  readonly firstSeat?: number;
+  readonly firstMoveFree?: boolean;
+  readonly roundIndex?: number;
 }
 
 export interface ReplayResult {
@@ -56,6 +60,9 @@ export function replay(
     ...(options.startingPlayerIndex === undefined
       ? {}
       : { startingPlayerIndex: options.startingPlayerIndex }),
+    ...(options.firstSeat === undefined ? {} : { firstSeat: options.firstSeat }),
+    ...(options.firstMoveFree === undefined ? {} : { firstMoveFree: options.firstMoveFree }),
+    ...(options.roundIndex === undefined ? {} : { roundIndex: options.roundIndex }),
   });
   const events: GameEvent[] = [];
 

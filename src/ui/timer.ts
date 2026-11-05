@@ -55,6 +55,46 @@ export function startChopCountdown(
   return () => clearInterval(interval);
 }
 
+export interface TourCountdownOptions {
+  readonly nextRoundAt: number | null;
+  readonly serverNow: number;
+  /** Hiện `Ván mới sau Xs`; hết giờ đổi thành `Đang chia ván mới…`. */
+  readonly onTick?: (remainingMs: number) => void;
+}
+
+/** Đếm ngược 10s trên overlay kết quả ván (doc-4 §3.2). */
+export function startTourCountdown(
+  element: HTMLElement,
+  options: TourCountdownOptions,
+): () => void {
+  const nextRoundAt = options.nextRoundAt;
+  if (nextRoundAt === null) {
+    element.textContent = 'Đang chờ ván mới…';
+    return () => undefined;
+  }
+  const receivedAt = Date.now();
+  let done = false;
+  const update = (): void => {
+    const remaining = computeRemainingMs(
+      nextRoundAt,
+      options.serverNow,
+      receivedAt,
+      Date.now(),
+    );
+    const label =
+      remaining > 0 ? `Ván mới sau ${Math.ceil(remaining / 1000)}s` : 'Đang chia ván mới…';
+    if (element.textContent !== label) element.textContent = label;
+    element.dataset['level'] = remaining > 0 ? 'warn' : 'done';
+    if (remaining <= 0 && !done) {
+      done = true;
+      options.onTick?.(0);
+    }
+  };
+  update();
+  const interval = setInterval(update, 200);
+  return () => clearInterval(interval);
+}
+
 export function timerLevel(remainingMs: number, warnMs: number): TimerLevel {
   if (remainingMs <= 0) return 'done';
   if (remainingMs <= warnMs) return 'warn';

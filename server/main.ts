@@ -16,7 +16,7 @@ const maxRooms = positiveInt(process.env['MAX_ROOMS'], 500);
 startServer({ port, host, roomTtlMs, maxRooms })
   .then((server) => {
     console.log(
-      `[game2-server] listening http://${host}:${server.port} and ws://${host}:${server.port} (rules 1.2.0)`,
+      `[game2-server] listening http://${host}:${server.port} and ws://${host}:${server.port} (rules 1.3.0)`,
     );
     const shutdown = (): void => {
       server

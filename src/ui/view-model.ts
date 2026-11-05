@@ -7,6 +7,7 @@ import type {
   RoomView,
   StatePlayerView,
 } from '../net/protocol';
+import { tourPhaseLabel } from './tour';
 
 export type Screen = 'lobby' | 'table';
 
@@ -103,6 +104,14 @@ export interface TableSeatView {
   readonly isYou: boolean;
   readonly connected: boolean;
   readonly surrendered: boolean;
+  /** Ghế đã chốt hạng (về đích hoặc rời ván) — có thể xảy ra khi ván còn chơi tiếp. */
+  readonly placed: boolean;
+  /** Hạng đã chốt theo `state.ranking`; null khi chưa có trong bảng hạng. */
+  readonly place: RankingView['place'] | null;
+  /** rev6 §1.7: giữ đủ 13 lá → đền, rời ván, không hạng/không thối. */
+  readonly denOut: boolean;
+  /** Điểm đền đã trả (dương), 0 khi không đền. */
+  readonly denPoints: number;
 }
 
 export interface TableViewModel {
@@ -116,9 +125,25 @@ export interface TableViewModel {
   readonly handCount: number;
   readonly tableCards: readonly CardView[];
   readonly lastPlayLabel: string | null;
+  /** Hạng đã chốt, có thể rỗng/thiếu ghế khi ván còn chơi tiếp. */
   readonly ranking: readonly RankingView[] | null;
   readonly scores: readonly number[] | null;
   readonly isFinished: boolean;
+  /** Ghế của bạn đã chốt hạng/đã rời ván hay chưa. */
+  readonly youPlaced: boolean;
+  /** Hạng của bạn nếu đã có trong bảng hạng. */
+  readonly youPlace: RankingView['place'] | null;
+  /** Bạn giữ đủ 13 lá → đã đền, rời ván (rev6 §1.7). */
+  readonly youDenOut: boolean;
+  /** `Ván i/N` của tour; null khi phòng không mở tour. */
+  readonly roundIndex: number | null;
+  readonly soVan: number | null;
+  /** Ghế đi trước ván này (`state.firstSeat`), null nếu server cũ. */
+  readonly firstSeat: number | null;
+  readonly firstPlayerNickname: string | null;
+  /** true = lượt đầu ván này đánh tự do (ván ≥ 2). */
+  readonly firstMoveFree: boolean;
+  readonly tourLabel: string | null;
 }
 
 const PHASE_LABELS: Readonly<Record<RoomPhase, string>> = {
@@ -135,12 +160,39 @@ export function buildTableView(
   const statePlayers = new Map<number, StatePlayerView>(
     (state?.players ?? []).map((player) => [player.seat, player]),
   );
-  const turnSeat = state !== null && state.phase === 'playing' ? state.turn : null;
+
+  // Khi ván còn chơi tiếp, `ranking` chỉ chứa các ghế đã chốt hạng (có thể rỗng/thiếu ghế).
+  const ranking = state?.ranking ?? [];
+  const placeBySeat = new Map<number, RankingView['place']>();
+  for (const entry of ranking) {
+    if (typeof entry?.seat !== 'number') continue;
+    if (!placeBySeat.has(entry.seat)) placeBySeat.set(entry.seat, entry.place);
+  }
+  // `placed` là cờ server chốt; dùng làm fallback khi ranking chưa/không có entry cho ghế đó.
+  const placedSeats = new Set<number>(placeBySeat.keys());
+  for (const player of statePlayers.values()) {
+    if (player.placed === true) placedSeats.add(player.seat);
+  }
+
+  const denPointsBySeat = new Map<number, number>();
+  for (const entry of state?.denBai ?? []) {
+    denPointsBySeat.set(entry.who, (denPointsBySeat.get(entry.who) ?? 0) + entry.points);
+  }
+
+  const rawTurnSeat = state !== null && state.phase === 'playing' ? state.turn : null;
+  // Ghế đã về/đã đền không bao giờ bị highlight lượt, kể cả khi state tạm thời trỏ tới họ.
+  const turnSeat =
+    rawTurnSeat !== null &&
+    (placedSeats.has(rawTurnSeat) || denPointsBySeat.has(rawTurnSeat))
+      ? null
+      : rawTurnSeat;
 
   const seats: TableSeatView[] = [];
   for (let seat = 0; seat < room.maxSeats; seat += 1) {
     const roomPlayer = room.players.find((entry) => entry.seat === seat);
     const statePlayer = statePlayers.get(seat);
+    const place = placeBySeat.get(seat) ?? null;
+    const denPoints = denPointsBySeat.get(seat) ?? 0;
     seats.push({
       seat,
       label: `Ghế ${seat + 1}`,
@@ -150,8 +202,15 @@ export function buildTableView(
       isYou: roomPlayer !== undefined && seat === room.you.seat,
       connected: statePlayer ? statePlayer.connected : roomPlayer?.connected ?? false,
       surrendered: statePlayer ? statePlayer.surrendered : false,
+      placed: placedSeats.has(seat),
+      place,
+      denOut: statePlayer?.denOut === true || denPoints > 0,
+      denPoints,
     });
   }
+
+  const youPlace = placeBySeat.get(room.you.seat) ?? null;
+  const youPlaced = placedSeats.has(room.you.seat);
 
   const turnPlayer = turnSeat === null ? undefined : state?.players.find((p) => p.seat === turnSeat);
   const turnLabel =
@@ -167,6 +226,17 @@ export function buildTableView(
     ? `${lastPlayer ? lastPlayer.nickname : `Ghế ${table.seat + 1}`} đánh ${table.comboSize} lá`
     : null;
 
+  const firstSeat = state?.firstSeat ?? null;
+  const firstPlayer =
+    firstSeat === null ? undefined : state?.players.find((p) => p.seat === firstSeat);
+  const firstPlayerNickname =
+    firstSeat === null
+      ? null
+      : firstPlayer?.nickname ??
+        room.players.find((p) => p.seat === firstSeat)?.nickname ??
+        `Ghế ${firstSeat + 1}`;
+  const roundIndex = state?.roundIndex ?? room.tour?.roundIndex ?? null;
+
   return {
     roomCode: room.code,
     phase: state?.phase ?? room.phase,
@@ -181,5 +251,15 @@ export function buildTableView(
     ranking: state?.ranking ?? null,
     scores: state?.scores ?? null,
     isFinished: (state?.phase ?? room.phase) === 'finished',
+    youPlaced,
+    youPlace,
+    youDenOut:
+      statePlayers.get(room.you.seat)?.denOut === true || denPointsBySeat.has(room.you.seat),
+    roundIndex,
+    soVan: room.tour?.soVan ?? null,
+    firstSeat,
+    firstPlayerNickname,
+    firstMoveFree: state?.firstMoveFree === true,
+    tourLabel: tourPhaseLabel(room.tour),
   };
 }

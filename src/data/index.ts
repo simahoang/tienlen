@@ -3,6 +3,8 @@ import type {
   ChopAttacker,
   ChopTarget,
   ComboKey,
+  FallbackPlace,
+  FirstPlayerSubsequentConfig,
   Rank,
   StartingPlayerConfig,
   Suit,
@@ -135,6 +137,35 @@ export interface TurnRules {
   readonly autoPlayLowestWhenLeading: boolean;
 }
 
+/** doc-4 §4.2/§4.3 — luật đi trước ván ≥ 2 của tour. */
+export type FirstPlayerSubsequentRules = FirstPlayerSubsequentConfig & {
+  readonly fallbackOrder: readonly FallbackPlace[];
+  readonly newSeatLast: boolean;
+  readonly emptyFallback: string;
+  readonly timeoutLeadPlaysLowest: boolean;
+  readonly appliesTo: string;
+  readonly note: string;
+};
+
+/** doc-4 §3/§10 — vòng đời tour nhiều ván. */
+export interface TourRules {
+  readonly allowedCounts: readonly number[];
+  readonly min: number;
+  readonly max: number;
+  readonly defaultCount: number;
+  readonly resultDisplayMs: number;
+  readonly autoNext: boolean;
+  readonly requireReady: boolean;
+  readonly allowSkip: boolean;
+  readonly minPlayersToStart: number;
+  readonly resumeCountdownMs: number;
+  readonly afkKickConsecutiveRounds: number;
+  readonly earlyEndByHost: boolean;
+  readonly allowMidJoin: boolean;
+  readonly tourTieBreak: readonly string[];
+  readonly note: string;
+}
+
 export interface RulesConfig {
   readonly schemaVersion: number;
   readonly rulesVersion: string;
@@ -142,6 +173,8 @@ export interface RulesConfig {
   readonly deck: DeckRules;
   readonly deal: DealRules;
   readonly firstPlayer: StartingPlayerConfig;
+  readonly firstPlayerSubsequent: FirstPlayerSubsequentRules;
+  readonly tour: TourRules;
   readonly variants: readonly VariantSpec[];
   readonly flags: RulesFlags;
   readonly combos: Readonly<Record<ComboKey, ComboSpec>>;
@@ -238,6 +271,10 @@ function asStringArray(value: unknown, path: string): string[] {
   return asArray(value, path).map((item, index) => asString(item, `${path}[${index}]`));
 }
 
+function asIntegerArray(value: unknown, path: string, min = 0): number[] {
+  return asArray(value, path).map((item, index) => asInteger(item, `${path}[${index}]`, min));
+}
+
 function asRank(value: unknown, path: string): Rank {
   const rank = asString(value, path);
   if (!RANK_SET.has(rank)) fail(path, `rank không hợp lệ: ${rank}`);
@@ -313,6 +350,60 @@ function validateFirstPlayer(root: Record<string, unknown>): void {
   fallbackSuits.forEach((suit, index) => asSuit(suit, `firstPlayer.fallbackSuits[${index}]`));
   asString(firstPlayer['fallbackRule'], 'firstPlayer.fallbackRule');
   asString(firstPlayer['rejectCode'], 'firstPlayer.rejectCode');
+}
+
+const FALLBACK_PLACES = ['nhi', 'ba', 'bet'] as const;
+
+function validateFirstPlayerSubsequent(root: Record<string, unknown>): void {
+  const config = asRecord(root['firstPlayerSubsequent'], 'firstPlayerSubsequent');
+  asBoolean(config['winnerLeads'], 'firstPlayerSubsequent.winnerLeads');
+  asBoolean(config['firstMoveFree'], 'firstPlayerSubsequent.firstMoveFree');
+  asString(config['fallback'], 'firstPlayerSubsequent.fallback');
+  const order = asStringArray(config['fallbackOrder'], 'firstPlayerSubsequent.fallbackOrder');
+  if (order.length === 0) fail('firstPlayerSubsequent.fallbackOrder', 'phải có ít nhất 1 hạng');
+  for (const place of order) {
+    if (!(FALLBACK_PLACES as readonly string[]).includes(place)) {
+      fail('firstPlayerSubsequent.fallbackOrder', `hạng không hợp lệ: ${place}`);
+    }
+  }
+  if (new Set(order).size !== order.length) {
+    fail('firstPlayerSubsequent.fallbackOrder', 'có hạng trùng');
+  }
+  asBoolean(config['newSeatLast'], 'firstPlayerSubsequent.newSeatLast');
+  asString(config['emptyFallback'], 'firstPlayerSubsequent.emptyFallback');
+  asBoolean(config['timeoutLeadPlaysLowest'], 'firstPlayerSubsequent.timeoutLeadPlaysLowest');
+  const rejectCode = config['rejectCode'];
+  if (rejectCode !== null && rejectCode !== undefined) {
+    asString(rejectCode, 'firstPlayerSubsequent.rejectCode');
+  }
+  asString(config['appliesTo'], 'firstPlayerSubsequent.appliesTo');
+  asString(config['note'], 'firstPlayerSubsequent.note');
+}
+
+function validateTour(root: Record<string, unknown>): void {
+  const tour = asRecord(root['tour'], 'tour');
+  const allowed = asIntegerArray(tour['allowedCounts'], 'tour.allowedCounts', 2);
+  if (allowed.length === 0) fail('tour.allowedCounts', 'phải có ít nhất 1 giá trị');
+  if (new Set(allowed).size !== allowed.length) fail('tour.allowedCounts', 'có giá trị trùng');
+  const min = asInteger(tour['min'], 'tour.min', 2);
+  const max = asInteger(tour['max'], 'tour.max', 2);
+  if (min > max) fail('tour.min', 'phải nhỏ hơn hoặc bằng tour.max');
+  const defaultCount = asInteger(tour['defaultCount'], 'tour.defaultCount', 2);
+  if (defaultCount < min || defaultCount > max) {
+    fail('tour.defaultCount', `phải nằm trong ${min}..${max}`);
+  }
+  asInteger(tour['resultDisplayMs'], 'tour.resultDisplayMs', 0);
+  asBoolean(tour['autoNext'], 'tour.autoNext');
+  asBoolean(tour['requireReady'], 'tour.requireReady');
+  asBoolean(tour['allowSkip'], 'tour.allowSkip');
+  asInteger(tour['minPlayersToStart'], 'tour.minPlayersToStart', 2);
+  asInteger(tour['resumeCountdownMs'], 'tour.resumeCountdownMs', 0);
+  asInteger(tour['afkKickConsecutiveRounds'], 'tour.afkKickConsecutiveRounds', 1);
+  asBoolean(tour['earlyEndByHost'], 'tour.earlyEndByHost');
+  asBoolean(tour['allowMidJoin'], 'tour.allowMidJoin');
+  const tieBreak = asStringArray(tour['tourTieBreak'], 'tour.tourTieBreak');
+  if (tieBreak.length === 0) fail('tour.tourTieBreak', 'phải có ít nhất 1 tiêu chí');
+  asString(tour['note'], 'tour.note');
 }
 
 function validateFlags(root: Record<string, unknown>): Record<string, boolean> {
@@ -511,6 +602,8 @@ export function parseRulesConfig(raw: unknown): RulesConfig {
   validateDeck(root);
   validateDeal(root);
   validateFirstPlayer(root);
+  validateFirstPlayerSubsequent(root);
+  validateTour(root);
   validateVariants(root);
   const flags = validateFlags(root);
   const combos = validateCombos(root);

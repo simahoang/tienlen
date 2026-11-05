@@ -50,6 +50,10 @@ export interface MatchResultRecord {
 export interface MatchConfig {
   readonly windowMs: number;
   readonly turnMs: number;
+  /** doc-4 §4: thông tin cần để replay đúng ván trong tour. */
+  readonly roundIndex?: number;
+  readonly firstSeat?: number;
+  readonly firstMoveFree?: boolean;
 }
 
 export interface StoredMatch {
@@ -62,6 +66,9 @@ export interface StoredMatch {
   readonly startedAt: string;
   readonly endedAt: string | null;
   readonly result: MatchResultRecord | null;
+  /** doc-4 §7: match thuộc tour nào + ván thứ mấy. */
+  readonly tourId: string | null;
+  readonly roundIndex: number | null;
 }
 
 export interface StoredAction {
@@ -82,6 +89,36 @@ export interface CreateMatchInput {
   readonly rulesVersion: string;
   readonly config: MatchConfig;
   readonly players: readonly StoredPlayer[];
+  readonly tourId?: string | null;
+  readonly roundIndex?: number | null;
+}
+
+/** doc-4 §7: bảng `tours`. */
+export interface TourRecord {
+  readonly tourId: string;
+  readonly roomCode: string;
+  readonly totalRounds: number;
+  readonly createdBy: string;
+  readonly createdAt?: string;
+}
+
+export type TourStatus = 'running' | 'paused' | 'finished' | 'incomplete';
+
+/** doc-4 §7: bảng `tour_scores`, cập nhật cuối mỗi ván. */
+export interface TourScoreRecord {
+  readonly tourId: string;
+  readonly account: string;
+  readonly nickname: string;
+  readonly seat: number;
+  readonly pointsTotal: number;
+  readonly wins: number;
+  readonly chatThu: number;
+  readonly chatTra: number;
+  readonly thoiTra: number;
+  readonly denTra: number;
+  readonly roundsPlayed: number;
+  readonly joinedMid: boolean;
+  readonly leftMid: boolean;
 }
 
 export interface AppendActionInput {
@@ -133,7 +170,9 @@ CREATE TABLE IF NOT EXISTS matches (
   players_json TEXT NOT NULL,
   started_at TEXT NOT NULL,
   ended_at TEXT,
-  result_json TEXT
+  result_json TEXT,
+  tour_id TEXT,
+  round_index INTEGER
 );
 CREATE TABLE IF NOT EXISTS actions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,6 +186,32 @@ CREATE TABLE IF NOT EXISTS actions (
   UNIQUE (match_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_actions_match_seq ON actions (match_id, seq);
+CREATE TABLE IF NOT EXISTS tours (
+  tour_id TEXT PRIMARY KEY,
+  room_code TEXT NOT NULL,
+  total_rounds INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  rounds_played INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS tour_scores (
+  tour_id TEXT NOT NULL,
+  account TEXT NOT NULL,
+  nickname TEXT NOT NULL,
+  seat INTEGER NOT NULL,
+  points_total INTEGER NOT NULL DEFAULT 0,
+  wins INTEGER NOT NULL DEFAULT 0,
+  chat_thu INTEGER NOT NULL DEFAULT 0,
+  chat_tra INTEGER NOT NULL DEFAULT 0,
+  thoi_tra INTEGER NOT NULL DEFAULT 0,
+  den_tra INTEGER NOT NULL DEFAULT 0,
+  rounds_played INTEGER NOT NULL DEFAULT 0,
+  joined_mid INTEGER NOT NULL DEFAULT 0,
+  left_mid INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (tour_id, account)
+);
 `;
 
 /** Migration nhẹ cho DB cũ: thêm cột nếu chưa có (tên cột cố định trong code). */
@@ -222,6 +287,10 @@ export class GameStore {
       db.exec(SCHEMA);
       ensureColumn(db, 'matches', 'config_json', 'TEXT');
       ensureColumn(db, 'actions', 'result', "TEXT NOT NULL DEFAULT 'ok'");
+      ensureColumn(db, 'matches', 'tour_id', 'TEXT');
+      ensureColumn(db, 'matches', 'round_index', 'INTEGER');
+      // Index trên cột migrate phải tạo SAU ensureColumn, nếu không DB legacy sẽ lỗi "no such column".
+      db.exec('CREATE INDEX IF NOT EXISTS idx_matches_tour ON matches (tour_id, round_index);');
       return db;
     } catch (error) {
       this.warn(
@@ -263,7 +332,7 @@ export class GameStore {
     try {
       const info = db
         .prepare(
-          'INSERT INTO matches (room_code, seed, rules_version, config_json, players_json, started_at) VALUES (?, ?, ?, ?, ?, ?)',
+          'INSERT INTO matches (room_code, seed, rules_version, config_json, players_json, started_at, tour_id, round_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         )
         .run(
           input.roomCode,
@@ -272,11 +341,106 @@ export class GameStore {
           JSON.stringify(input.config),
           JSON.stringify(input.players),
           this.now(),
+          input.tourId ?? null,
+          input.roundIndex ?? null,
         );
       return integer(info.lastInsertRowid);
     } catch (error) {
       this.warn(`ghi matches thất bại: ${describe(error)}`);
       return null;
+    }
+  }
+
+  /** doc-4 §7: mở tour khi chia ván 1. */
+  createTour(input: TourRecord): boolean {
+    const db = this.db;
+    if (!db) return false;
+    try {
+      db.prepare(
+        'INSERT OR IGNORE INTO tours (tour_id, room_code, total_rounds, status, rounds_played, created_by, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)',
+      ).run(
+        input.tourId,
+        input.roomCode,
+        input.totalRounds,
+        'running',
+        input.createdBy,
+        input.createdAt ?? this.now(),
+      );
+      return true;
+    } catch (error) {
+      this.warn(`ghi tours thất bại: ${describe(error)}`);
+      return false;
+    }
+  }
+
+  /** Ghi đè điểm tour của 1 người sau mỗi ván (idempotent theo tour_id + account). */
+  upsertTourScore(input: TourScoreRecord): boolean {
+    const db = this.db;
+    if (!db) return false;
+    try {
+      db.prepare(
+        `INSERT INTO tour_scores (tour_id, account, nickname, seat, points_total, wins, chat_thu, chat_tra, thoi_tra, den_tra, rounds_played, joined_mid, left_mid)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(tour_id, account) DO UPDATE SET
+           nickname = excluded.nickname,
+           seat = excluded.seat,
+           points_total = excluded.points_total,
+           wins = excluded.wins,
+           chat_thu = excluded.chat_thu,
+           chat_tra = excluded.chat_tra,
+           thoi_tra = excluded.thoi_tra,
+           den_tra = excluded.den_tra,
+           rounds_played = excluded.rounds_played,
+           joined_mid = excluded.joined_mid,
+           left_mid = excluded.left_mid`,
+      ).run(
+        input.tourId,
+        input.account,
+        input.nickname,
+        input.seat,
+        input.pointsTotal,
+        input.wins,
+        input.chatThu,
+        input.chatTra,
+        input.thoiTra,
+        input.denTra,
+        input.roundsPlayed,
+        input.joinedMid ? 1 : 0,
+        input.leftMid ? 1 : 0,
+      );
+      return true;
+    } catch (error) {
+      this.warn(`ghi tour_scores ${input.tourId}/${input.account} thất bại: ${describe(error)}`);
+      return false;
+    }
+  }
+
+  finishTour(tourId: string, status: TourStatus, roundsPlayed: number): boolean {
+    const db = this.db;
+    if (!db) return false;
+    try {
+      const info = db
+        .prepare('UPDATE tours SET status = ?, rounds_played = ?, finished_at = ? WHERE tour_id = ?')
+        .run(status, roundsPlayed, this.now(), tourId);
+      return integer(info.changes) > 0;
+    } catch (error) {
+      this.warn(`cập nhật tour ${tourId} thất bại: ${describe(error)}`);
+      return false;
+    }
+  }
+
+  /** Các match của 1 tour, sắp theo ván — dùng để đối chiếu/replay độc lập từng ván. */
+  listTourMatches(tourId: string): StoredMatch[] {
+    const db = this.db;
+    if (!db) return [];
+    try {
+      return db
+        .prepare('SELECT * FROM matches WHERE tour_id = ? ORDER BY round_index, id')
+        .all(tourId)
+        .map((row) => toStoredMatch(row));
+    } catch (error) {
+      this.warn(`đọc matches tour ${tourId} thất bại: ${describe(error)}`);
+      return [];
     }
   }
 
@@ -407,7 +571,15 @@ export class GameStore {
 
     let replayed: ReplayResult;
     try {
-      replayed = replay(match.seed, match.players.length, matchRules, actions);
+      replayed = replay(match.seed, match.players.length, matchRules, actions, {
+        ...(match.config?.roundIndex === undefined
+          ? {}
+          : { roundIndex: match.config.roundIndex }),
+        ...(match.config?.firstSeat === undefined ? {} : { firstSeat: match.config.firstSeat }),
+        ...(match.config?.firstMoveFree === undefined
+          ? {}
+          : { firstMoveFree: match.config.firstMoveFree }),
+      });
     } catch (error) {
       if (error instanceof ReplayError) throw error;
       throw new ReplayError(
@@ -494,7 +666,17 @@ function toStoredMatch(row: Record<string, unknown>): StoredMatch {
     typeof rawConfig['windowMs'] === 'number' &&
     typeof rawConfig['turnMs'] === 'number'
   ) {
-    config = { windowMs: rawConfig['windowMs'], turnMs: rawConfig['turnMs'] };
+    config = {
+      windowMs: rawConfig['windowMs'],
+      turnMs: rawConfig['turnMs'],
+      ...(typeof rawConfig['roundIndex'] === 'number'
+        ? { roundIndex: rawConfig['roundIndex'] }
+        : {}),
+      ...(typeof rawConfig['firstSeat'] === 'number' ? { firstSeat: rawConfig['firstSeat'] } : {}),
+      ...(typeof rawConfig['firstMoveFree'] === 'boolean'
+        ? { firstMoveFree: rawConfig['firstMoveFree'] }
+        : {}),
+    };
   }
 
   return {
@@ -507,6 +689,8 @@ function toStoredMatch(row: Record<string, unknown>): StoredMatch {
     startedAt: text(row['started_at']),
     endedAt: typeof row['ended_at'] === 'string' ? row['ended_at'] : null,
     result,
+    tourId: typeof row['tour_id'] === 'string' ? row['tour_id'] : null,
+    roundIndex: typeof row['round_index'] === 'number' ? row['round_index'] : null,
   };
 }
 

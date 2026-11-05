@@ -57,3 +57,25 @@ export interface StartingPlayerConfig {
   readonly fallbackSuits: readonly Suit[];
   readonly rejectCode?: string;
 }
+
+/** Hạng dùng cho fallback "ai đi trước ván ≥ 2" (doc-4 §4.3): Nhì → Ba → Bét. */
+export type FallbackPlace = 'nhi' | 'ba' | 'bet';
+
+/** doc-4 §4.2/§4.3 — ván 2+ của tour. Đọc từ `data/rules.json#firstPlayerSubsequent`. */
+export interface FirstPlayerSubsequentConfig {
+  /** true: người hạng Nhất ván trước đi trước. */
+  readonly winnerLeads: boolean;
+  /** true: lượt đầu ván ≥ 2 đánh tự do (không bắt buộc chứa 3♠). */
+  readonly firstMoveFree: boolean;
+  /** `highestPlacedPresent` = hạng cao nhất còn trong phòng. */
+  readonly fallback: string;
+  /** Thứ tự fallback khi Nhất ván trước vắng mặt. */
+  readonly fallbackOrder?: readonly FallbackPlace[];
+  /** true: ghế mới vào giữa tour (chưa có hạng ván trước) xếp sau cùng. */
+  readonly newSeatLast?: boolean;
+  /** `seat0`: không còn ai có hạng thì ghế chủ phòng đi trước. */
+  readonly emptyFallback?: string;
+  /** true: hết giờ ở lượt dẫn ván ≥ 2 → auto đánh lá thấp nhất (tự do). */
+  readonly timeoutLeadPlaysLowest?: boolean;
+  readonly rejectCode?: string | null;
+}

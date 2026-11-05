@@ -1,17 +1,47 @@
 import { rules } from '../data';
 import type { ConnectionStatus } from '../net/client';
-import type { CardView } from '../net/protocol';
+import type {
+  CardView,
+  DenBaiView,
+  TourEndView,
+  TourPausedView,
+  TourPhase,
+  TourResultView,
+} from '../net/protocol';
+import { activateDialog } from '../ui/dom';
 import { formatConnectionStatus } from '../ui/errors';
-import { buildResultRows, formatPoints, type BreakdownEntry } from '../ui/result';
+import { buildResultRows, formatPlace, formatPoints, type BreakdownEntry } from '../ui/result';
 import { sortCards } from '../ui/table-logic';
 import { formatCountdown } from '../ui/timer';
+import { buildRoundBanner, isTourResultStale } from '../ui/tour';
 import type { TableSeatView, TableViewModel } from '../ui/view-model';
+import {
+  renderDenBannerFor,
+  renderTourPausedOverlay,
+  renderTourResultOverlay,
+  renderTourSummaryOverlay,
+} from './tour-overlay';
 
 export interface ChopView {
   readonly cards: readonly CardView[];
   readonly label: string;
   readonly remainingMs: number;
   readonly sent: boolean;
+}
+
+export interface TableTourRenderState {
+  readonly result: TourResultView | null;
+  readonly paused: TourPausedView | null;
+  readonly end: TourEndView | null;
+  /** Lần đền 13 lá gần nhất (chỉ hiện khi ghế tương ứng còn `denOut` trong ván). */
+  readonly denBai: DenBaiView | null;
+  readonly maxSeats: number;
+  readonly isHost: boolean;
+  /** Pha tour hiện tại từ `room.tour`; null = phòng không có tour. */
+  readonly phase: TourPhase | null;
+  /** Mốc server của state gần nhất, dùng cho đếm ngược `nextRoundAt`. */
+  readonly serverNow: number;
+  readonly receivedAt: number;
 }
 
 export interface TableActions {
@@ -22,6 +52,9 @@ export interface TableActions {
   chop(): void;
   toggleMute(): void;
   leaveRoom(): void;
+  leaveTour(): void;
+  endTour(): void;
+  newTour(soVan: number): void;
 }
 
 export interface TableRenderState {
@@ -37,6 +70,7 @@ export interface TableRenderState {
   readonly muted: boolean;
   readonly chop: ChopView | null;
   readonly breakdown: readonly BreakdownEntry[] | null;
+  readonly tour: TableTourRenderState;
 }
 
 function element<K extends keyof HTMLElementTagNameMap>(
@@ -98,6 +132,15 @@ function seatRow(seat: TableSeatView): HTMLLIElement {
   row.dataset['testid'] = `turn-seat-${seat.seat}`;
   if (seat.nickname === null) row.classList.add('table-seat--empty');
   if (seat.isYou) row.classList.add('table-seat--you');
+  if (seat.placed) {
+    row.classList.add('table-seat--placed');
+    row.dataset['placed'] = 'true';
+  }
+  if (seat.denOut) {
+    row.classList.add('table-seat--den');
+    row.dataset['denOut'] = 'true';
+  }
+  if (seat.place !== null) row.dataset['place'] = seat.place;
   if (seat.isTurn) {
     row.classList.add('table-seat--turn');
     row.setAttribute('aria-current', 'true');
@@ -105,9 +148,15 @@ function seatRow(seat: TableSeatView): HTMLLIElement {
   if (seat.surrendered) row.classList.add('table-seat--out');
 
   row.append(text('span', seat.label, 'table-seat__label'));
-  const cards = text('span', `${seat.cardsLeft} lá`, 'table-seat__cards');
-  cards.dataset['testid'] = `cards-left-${seat.seat}`;
-  row.append(cards);
+  if (seat.denOut) {
+    const denCards = text('span', '—', 'table-seat__cards');
+    denCards.dataset['testid'] = `cards-left-${seat.seat}`;
+    row.append(denCards);
+  } else {
+    const cards = text('span', `${seat.cardsLeft} lá`, 'table-seat__cards');
+    cards.dataset['testid'] = `cards-left-${seat.seat}`;
+    row.append(cards);
+  }
 
   if (seat.nickname === null) {
     row.append(text('span', 'Trống', 'table-seat__empty'));
@@ -117,11 +166,47 @@ function seatRow(seat: TableSeatView): HTMLLIElement {
   row.append(text('span', seat.nickname, 'table-seat__name'));
   const badges = element('span', 'table-seat__badges');
   if (seat.isTurn) badges.append(text('span', 'Lượt', 'badge badge--turn'));
+  if (seat.denOut) {
+    const denBadge = text('span', 'Đã đền · rời ván', 'badge badge--den');
+    denBadge.dataset['testid'] = `seat-den-${seat.seat}`;
+    badges.append(denBadge);
+    if (seat.denPoints > 0) {
+      const denPoints = text('span', `−${seat.denPoints} điểm`, 'badge badge--den-points');
+      denPoints.dataset['testid'] = `seat-den-points-${seat.seat}`;
+      badges.append(denPoints);
+    }
+  } else if (seat.place !== null) {
+    const placeBadge = text('span', formatPlace(seat.place), 'badge badge--place');
+    placeBadge.dataset['testid'] = `seat-place-${seat.seat}`;
+    placeBadge.dataset['place'] = seat.place;
+    badges.append(placeBadge);
+  } else if (seat.placed || seat.surrendered) {
+    const outBadge = text('span', 'Đã rời', 'badge badge--off');
+    outBadge.dataset['testid'] = `seat-place-${seat.seat}`;
+    badges.append(outBadge);
+  }
   if (seat.isYou) badges.append(text('span', 'Bạn', 'badge'));
-  if (seat.surrendered) badges.append(text('span', 'Đã rời', 'badge badge--off'));
   if (!seat.connected) badges.append(text('span', 'Mất kết nối', 'badge badge--off'));
   row.append(badges);
   return row;
+}
+
+/** Người đã chốt hạng nhưng ván còn chơi tiếp: không còn nút hành động, chỉ chờ. */
+function placedNotice(view: TableViewModel): HTMLElement {
+  const panel = element('section', 'waiting');
+  panel.dataset['testid'] = 'placed-notice';
+  panel.setAttribute('role', 'status');
+  panel.setAttribute('aria-live', 'polite');
+  const title = view.youDenOut
+    ? 'Bạn đã đền 13 lá, rời ván này'
+    : view.youPlace !== null
+      ? `Bạn đã về ${formatPlace(view.youPlace)}`
+      : 'Bạn đã rời ván';
+  panel.append(
+    text('p', title, 'waiting__title'),
+    text('p', 'Chờ ván kết thúc…', 'waiting__hint'),
+  );
+  return panel;
 }
 
 function connectionBanner(status: ConnectionStatus, attempt: number): HTMLElement | null {
@@ -158,41 +243,9 @@ function chopPanel(chop: ChopView, actions: TableActions): HTMLElement {
   return panel;
 }
 
-function activateDialog(overlay: HTMLElement): void {
-  const card = overlay.querySelector<HTMLElement>('.result-overlay__card') ?? overlay;
-  const focusables = (): HTMLElement[] =>
-    Array.from(
-      card.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), a[href], input:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      ),
-    );
-  const first = focusables()[0];
-  if (first) first.focus({ preventScroll: true });
-  else overlay.focus({ preventScroll: true });
-
-  overlay.addEventListener('keydown', (event: KeyboardEvent) => {
-    if (event.key !== 'Tab') return;
-    const items = focusables();
-    const firstItem = items[0];
-    const lastItem = items[items.length - 1];
-    if (!firstItem || !lastItem) {
-      event.preventDefault();
-      overlay.focus({ preventScroll: true });
-      return;
-    }
-    if (event.shiftKey && document.activeElement === firstItem) {
-      event.preventDefault();
-      lastItem.focus({ preventScroll: true });
-    } else if (!event.shiftKey && document.activeElement === lastItem) {
-      event.preventDefault();
-      firstItem.focus({ preventScroll: true });
-    }
-  });
-}
-
 function resultOverlay(state: TableRenderState, actions: TableActions): HTMLElement | null {
   const { view } = state;
-  if (!view.isFinished || view.ranking === null) return null;
+  if (!view.isFinished || view.ranking === null || view.ranking.length === 0) return null;
   const names = new Map<number, string>();
   for (const seat of view.seats) {
     if (seat.nickname !== null) names.set(seat.seat, seat.nickname);
@@ -232,19 +285,15 @@ function resultOverlay(state: TableRenderState, actions: TableActions): HTMLElem
   }
 
   const actionsRow = element('div', 'result-overlay__actions');
-  const newGame = text('button', 'Ván mới', 'btn');
-  newGame.type = 'button';
-  newGame.disabled = true;
-  newGame.title = 'Server chưa hỗ trợ ván mới';
   const leave = text('button', 'Về sảnh', 'btn btn--primary');
   leave.type = 'button';
   leave.dataset['testid'] = 'leave-room';
   leave.addEventListener('click', () => {
     actions.leaveRoom();
   });
-  actionsRow.append(newGame, leave);
+  actionsRow.append(leave);
 
-  card.append(list, actionsRow, text('p', 'Server chưa hỗ trợ ván mới.', 'hint'));
+  card.append(list, actionsRow);
   overlay.append(card);
   return overlay;
 }
@@ -267,6 +316,12 @@ export function renderTable(
   const headRight = element('div', 'table-head__right');
   const phase = text('span', view.phaseLabel, 'pill');
   phase.dataset['testid'] = 'phase';
+  headRight.append(phase);
+  if (view.tourLabel !== null) {
+    const tourChip = text('span', view.tourLabel, 'pill pill--tour');
+    tourChip.dataset['testid'] = 'tour-round-chip';
+    headRight.append(tourChip);
+  }
   const mute = text('button', state.muted ? 'Bật tiếng' : 'Tắt tiếng', 'btn btn--tiny');
   mute.type = 'button';
   mute.dataset['testid'] = 'mute';
@@ -274,11 +329,16 @@ export function renderTable(
   mute.addEventListener('click', () => {
     actions.toggleMute();
   });
-  headRight.append(phase, mute);
+  headRight.append(mute);
   head.append(headInfo, headRight);
 
   const connection = connectionBanner(state.status, state.reconnectAttempt);
   if (connection !== null) screen.append(connection);
+
+  const names = new Map<number, string>();
+  for (const seat of view.seats) {
+    if (seat.nickname !== null) names.set(seat.seat, seat.nickname);
+  }
 
   const seats = element('ul', 'table-seats');
   seats.setAttribute('aria-label', 'Người chơi');
@@ -305,6 +365,33 @@ export function renderTable(
   boardTop.append(turn, timer, live);
   board.append(boardTop);
 
+  const roundBanner =
+    view.phase === 'playing' && view.tableCards.length === 0
+      ? buildRoundBanner({
+          roundIndex: view.roundIndex,
+          soVan: view.soVan,
+          firstNickname: view.firstPlayerNickname,
+          firstMoveFree: view.firstMoveFree,
+        })
+      : null;
+  if (roundBanner !== null && (roundBanner.firstLabel !== null || roundBanner.firstMoveFree)) {
+    const banner = element('div', 'round-banner');
+    banner.dataset['testid'] = 'round-banner';
+    banner.setAttribute('role', 'status');
+    banner.append(text('span', roundBanner.roundLabel, 'round-banner__round'));
+    if (roundBanner.firstLabel !== null) {
+      const first = text('span', roundBanner.firstLabel, 'round-banner__first');
+      first.dataset['testid'] = 'first-player';
+      banner.append(first);
+    }
+    if (roundBanner.firstMoveFree) {
+      const free = text('span', 'Lượt đầu tự do — không cần 3♠', 'round-banner__free');
+      free.dataset['testid'] = 'first-move-free';
+      banner.append(free);
+    }
+    board.append(banner);
+  }
+
   if (view.tableCards.length > 0) {
     const cards = element('div', 'board__cards');
     for (const card of view.tableCards) cards.append(tableCard(card));
@@ -316,14 +403,58 @@ export function renderTable(
     board.append(text('p', 'Chưa có nước đánh.', 'board__placeholder'));
   }
 
-  screen.append(head, seats, board);
+  screen.append(head, seats);
 
-  if (state.chop !== null) screen.append(chopPanel(state.chop, actions));
+  const denEvent = state.tour.denBai;
+  if (denEvent !== null && view.seats.some((seat) => seat.denOut)) {
+    screen.append(renderDenBannerFor(denEvent, names));
+  }
 
-  const overlay = resultOverlay(state, actions);
+  screen.append(board);
+
+  if ((view.youPlaced || view.youDenOut) && !view.isFinished) screen.append(placedNotice(view));
+
+  if (state.chop !== null && !view.youPlaced && !view.youDenOut) {
+    screen.append(chopPanel(state.chop, actions));
+  }
+
+  const tourResult = isTourResultStale(state.tour.result, view.roundIndex)
+    ? null
+    : state.tour.result;
+  let tourOverlay: HTMLElement | null = null;
+  if (state.tour.end !== null) {
+    tourOverlay = renderTourSummaryOverlay({
+      summary: state.tour.end,
+      youSeat: view.youSeat,
+      actions,
+    });
+  } else if (
+    state.tour.paused !== null &&
+    (state.tour.phase === null || state.tour.phase === 'paused')
+  ) {
+    tourOverlay = renderTourPausedOverlay({
+      paused: state.tour.paused,
+      maxSeats: state.tour.maxSeats,
+      isHost: state.tour.isHost,
+      actions,
+    });
+  } else if (tourResult !== null) {
+    tourOverlay = renderTourResultOverlay({
+      result: tourResult,
+      youSeat: view.youSeat,
+      serverNow: state.tour.serverNow,
+      receivedAt: state.tour.receivedAt,
+      now: Date.now(),
+      isHost: state.tour.isHost,
+      actions,
+      breakdown: state.breakdown,
+    });
+  }
+
+  const overlay = tourOverlay ?? resultOverlay(state, actions);
   if (overlay !== null) screen.append(overlay);
 
-  if (!view.isFinished) {
+  if (!view.isFinished && !view.youPlaced && !view.youDenOut && tourOverlay === null) {
     const hand = element('section', 'hand');
     hand.dataset['testid'] = 'hand';
     hand.setAttribute('aria-label', 'Bài trên tay');
@@ -370,6 +501,6 @@ export function renderTable(
   }
 
   mount.replaceChildren(screen);
-  const dialog = mount.querySelector<HTMLElement>('[data-testid="result-overlay"]');
+  const dialog = mount.querySelector<HTMLElement>('.result-overlay');
   if (dialog !== null) activateDialog(dialog);
 }

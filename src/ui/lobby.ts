@@ -1,15 +1,18 @@
 import type { ConnectionStatus } from '../net/client';
 import { escapeHtml } from './dom';
 import { formatConnectionStatus } from './errors';
+import { TOUR_DEFAULT, TOUR_PRESETS, resolveTourCount, tourCountHint, validateTourCountInput } from './tour';
 import type { LobbySeatView, LobbyView } from './view-model';
 
 export interface LobbyFormState {
   readonly nickname: string;
   readonly code: string;
+  /** Số ván/tour dạng chuỗi (ô tự nhập hoặc preset); rỗng = mặc định. */
+  readonly tourCount: string;
 }
 
 export interface LobbyActions {
-  createRoom(nickname: string): void;
+  createRoom(nickname: string, soVan?: number): void;
   joinRoom(code: string, nickname: string): void;
   setReady(ready: boolean): void;
   start(): void;
@@ -17,6 +20,7 @@ export interface LobbyActions {
   logout(): void;
   onNicknameChange(value: string): void;
   onCodeChange(value: string): void;
+  onTourCountChange(value: string): void;
 }
 
 export interface LobbyRenderState {
@@ -110,10 +114,40 @@ function nicknameField(state: LobbyRenderState): string {
       </label>`;
 }
 
+function tourCountField(state: LobbyRenderState): string {
+  const raw = state.form.tourCount;
+  const trimmed = raw.trim();
+  const check = validateTourCountInput(raw);
+  const presets = TOUR_PRESETS.map(
+    (count) => `<button type="button" class="segmented__btn${
+      trimmed === String(count) ? ' segmented__btn--active' : ''
+    }" data-testid="tour-count-${count}" data-value="${count}"
+      aria-pressed="${trimmed === String(count)}">${count}</button>`,
+  ).join('');
+  const errorText = check.error === null ? '' : escapeHtml(check.error);
+  const error = `<p class="msg msg--error" data-testid="tour-count-error" role="alert"${
+    errorText === '' ? ' hidden' : ''
+  }>${errorText}</p>`;
+  return `<fieldset class="tour-count" data-testid="tour-count">
+      <legend class="field__label">Số ván mỗi tour</legend>
+      <div class="segmented" role="group" aria-label="Chọn nhanh số ván">${presets}</div>
+      <label class="field field--compact" for="tour-count-custom">
+        <span class="sr-only">Hoặc tự nhập số ván</span>
+        <input id="tour-count-custom" class="field__input" name="tourCount" maxlength="2"
+          data-testid="tour-count-custom" inputmode="numeric" pattern="[0-9]*" autocomplete="off"
+          placeholder="${TOUR_DEFAULT}" value="${escapeHtml(raw)}" />
+      </label>
+      <p class="hint tour-count__hint" data-testid="tour-count-hint">${escapeHtml(tourCountHint())}</p>
+      ${error}
+    </fieldset>`;
+}
+
 function entryMarkup(state: LobbyRenderState): string {
   const authed = state.authName !== null;
   const online = state.status === 'open';
+  const tourError = validateTourCountInput(state.form.tourCount).error;
   const disabled = online && authed ? '' : ' disabled';
+  const createDisabled = online && authed && tourError === null ? '' : ' disabled';
   const retry =
     state.status === 'closed' || (state.authName === null && state.authNotice === null)
       ? '<button id="retry" class="btn btn--ghost" type="button" data-testid="retry">Thử lại</button>'
@@ -131,8 +165,9 @@ function entryMarkup(state: LobbyRenderState): string {
     ${identityMarkup(state)}
     <div class="panel">
       ${nicknameField(state)}
+      ${tourCountField(state)}
       <button id="create-room" class="btn btn--primary" type="button"
-        data-testid="create-room"${disabled}>Tạo phòng</button>
+        data-testid="create-room"${createDisabled}>Tạo phòng</button>
       <div class="divider"><span>hoặc vào phòng có sẵn</span></div>
       <label class="field" for="room-code">
         <span class="field__label">Mã phòng</span>
@@ -196,8 +231,42 @@ function bind(mount: HTMLElement, state: LobbyRenderState, actions: LobbyActions
     actions.onCodeChange(code.value);
   });
 
+  const tourCount = mount.querySelector<HTMLInputElement>('#tour-count-custom');
+
+  const syncTourCount = (value: string): void => {
+    const errorText = validateTourCountInput(value).error;
+    const errorEl = mount.querySelector<HTMLElement>('[data-testid="tour-count-error"]');
+    if (errorEl !== null) {
+      errorEl.textContent = errorText ?? '';
+      errorEl.hidden = errorText === null;
+    }
+    const create = mount.querySelector<HTMLButtonElement>('#create-room');
+    if (create !== null) {
+      create.disabled = !(state.status === 'open' && state.authName !== null) || errorText !== null;
+    }
+    mount.querySelectorAll<HTMLButtonElement>('.segmented__btn').forEach((preset) => {
+      const active = preset.dataset['value'] === value.trim();
+      preset.classList.toggle('segmented__btn--active', active);
+      preset.setAttribute('aria-pressed', String(active));
+    });
+    if (tourCount !== null && tourCount.value !== value) tourCount.value = value;
+  };
+
+  tourCount?.addEventListener('input', () => {
+    actions.onTourCountChange(tourCount.value);
+    syncTourCount(tourCount.value);
+  });
+
+  mount.querySelectorAll<HTMLButtonElement>('.segmented__btn').forEach((preset) => {
+    preset.addEventListener('click', () => {
+      const value = preset.dataset['value'] ?? '';
+      syncTourCount(value);
+      actions.onTourCountChange(value);
+    });
+  });
+
   mount.querySelector<HTMLButtonElement>('#create-room')?.addEventListener('click', () => {
-    actions.createRoom(state.form.nickname);
+    actions.createRoom(state.form.nickname, resolveTourCount(state.form.tourCount));
   });
 
   mount.querySelector<HTMLButtonElement>('#join-room')?.addEventListener('click', () => {

@@ -5,10 +5,14 @@ import {
   applyIntent,
   applyTimeout,
   calculateScore,
-  createGame,
+  createRoundGame,
+  resolveFirstSeat,
+  thoiPoints,
   type GameRulesInput,
   type GameState,
   type Intent,
+  type Place,
+  type Placement,
 } from '../src/rules/index';
 import type { Card } from '../src/rules/types';
 import type { AuthedSocket, Principal } from './auth/principal';
@@ -23,12 +27,21 @@ import {
   type CardView,
   type ChopWindowView,
   type ClientMessage,
+  type DenBaiView,
   type PublicGameState,
   type RankingView,
   type RoomPhase,
   type RoomView,
   type ServerMessage,
   type TableView,
+  type TourEndRowView,
+  type TourEndView,
+  type TourPausedView,
+  type TourPhase,
+  type TourRankPlace,
+  type TourResultView,
+  type TourScoreView,
+  type TourView,
 } from '../src/net/protocol';
 
 const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -57,6 +70,12 @@ export interface RoomManagerConfig {
   readonly roomTtlMs?: number;
   /** Giới hạn phòng đồng thời, mặc định 500. */
   readonly maxRooms?: number;
+  /** Thời gian hiện bảng điểm ván trước khi auto chia ván mới (ms), mặc định `rules.tour.resultDisplayMs`. */
+  readonly tourResultDisplayMs?: number;
+  /** Đếm ngược khi tour resume từ TAM_DUNG (ms), mặc định `rules.tour.resumeCountdownMs`. */
+  readonly tourResumeMs?: number;
+  /** Số người tối thiểu để chia ván (mặc định `rules.tour.minPlayersToStart`). */
+  readonly minPlayersToStart?: number;
   /** Logger lỗi socket/room; mặc định dùng console.warn. */
   readonly logger?: RoomLogger;
   /** Hook test: seed cố định. */
@@ -78,7 +97,28 @@ interface RoomPlayer {
   ready: boolean;
   connected: boolean;
   surrendered: boolean;
+  /** doc-4 §6: đã rời tour, ghế trống cho người mới; điểm tour không bảo lưu khi quay lại. */
+  left: boolean;
   socket: WebSocket | null;
+}
+
+/** doc-4 §5.2: điểm tour cộng dồn của 1 người trong tour hiện tại. */
+interface TourScore {
+  readonly account: string;
+  nickname: string;
+  seat: number;
+  joinedMid: boolean;
+  left: boolean;
+  pointsTotal: number;
+  wins: number;
+  chatThu: number;
+  chatTra: number;
+  thoiTra: number;
+  denTra: number;
+  roundsPlayed: number;
+  /** Điểm ván vừa kết thúc; reset đầu mỗi ván. */
+  roundPoints: number;
+  lastPlace: Place | null;
 }
 
 interface Binding {
@@ -103,8 +143,26 @@ export class Room {
   turnTimer: NodeJS.Timeout | null = null;
   windowTimer: NodeJS.Timeout | null = null;
   cleanupTimer: NodeJS.Timeout | null = null;
+  /** Timer auto chia ván mới (KET_QUA_VAN → VAN_(i+1)) hoặc resume từ TAM_DUNG. */
+  tourTimer: NodeJS.Timeout | null = null;
   readonly graceTimers = new Map<number, NodeJS.Timeout>();
   readonly expiryTimers = new Map<number, NodeJS.Timeout>();
+
+  // --- doc-4: state tour (server authoritative) ---
+  tourId: string | null = null;
+  soVan: number = rules.tour.defaultCount;
+  /** Ván đã/đang chơi gần nhất, 1..N; 0 = chưa chia ván nào. */
+  roundIndex = 0;
+  tourPhase: TourPhase | null = null;
+  tourIncomplete = false;
+  /** Mốc auto chia ván mới / resume (epoch ms). */
+  nextRoundAt: number | null = null;
+  readonly tourScores = new Map<string, TourScore>();
+  /** Hạng ván trước theo account (ghế có thể đổi khi compact lại). */
+  readonly previousPlaces = new Map<string, Place>();
+  /** Ghế đi trước + lượt đầu tự do của ván hiện tại (để ghi DB/replay). */
+  matchFirstSeat = 0;
+  matchFirstMoveFree = false;
 
   constructor(code: string) {
     this.code = code;
@@ -128,6 +186,14 @@ function nicknameOf(principal: Principal): string {
 
 function toCardView(card: { id: string; rank: CardView['rank']; suit: CardView['suit'] }): CardView {
   return { id: card.id, rank: card.rank, suit: card.suit };
+}
+
+/** Hạng tour theo thứ tự đã xếp (doc-4 §5.3). */
+function turnRankPlace(rank: number): TourRankPlace {
+  if (rank === 1) return 'nhat';
+  if (rank === 2) return 'nhi';
+  if (rank === 3) return 'ba';
+  return 'bet';
 }
 
 function engineRules(config: RoomManagerConfig): GameRulesInput {
@@ -165,7 +231,7 @@ export class RoomManager {
   private dispatch(socket: WebSocket, message: ClientMessage): void {
     switch (message.t) {
       case 'createRoom':
-        this.createRoom(socket);
+        this.createRoom(socket, message.soVan);
         return;
       case 'joinRoom':
         this.joinRoom(socket, message.code);
@@ -175,6 +241,15 @@ export class RoomManager {
         return;
       case 'start':
         this.startGame(socket);
+        return;
+      case 'leaveTour':
+        this.leaveTour(socket);
+        return;
+      case 'endTour':
+        this.endTour(socket);
+        return;
+      case 'newTour':
+        this.newTour(socket, message.soVan);
         return;
       case 'play':
       case 'pass':
@@ -197,7 +272,8 @@ export class RoomManager {
 
   /**
    * Đảm bảo một account chỉ giữ một ghế: đóng socket cũ (4001) trước khi socket mới vào phòng.
-   * Trả false khi account đang ở phòng khác lobby — không cướp ghế giữa ván.
+   * Trả false khi account đang ở phòng khác lobby — không cướp ghế giữa ván/tour,
+   * nên không bao giờ tạo ghế mới đè lên ghế đang chơi.
    */
   private claimAccount(account: string, socket: WebSocket): boolean {
     const current = this.accountSockets.get(account);
@@ -210,8 +286,8 @@ export class RoomManager {
       this.accountSockets.set(account, socket);
       return true;
     }
-    if (oldBinding.room.phase === 'playing') {
-      // Đang chơi: không cướp ghế giữa ván. Tab cũ phải thoát, tab mới bị từ chối.
+    if (oldBinding.room.phase === 'playing' || oldBinding.room.tourId !== null) {
+      // Đang chơi / đang trong tour: không cướp ghế, không sắp lại ghế. Tab cũ phải thoát.
       current.close(CLOSE_REPLACED, 'REPLACED');
       return false;
     }
@@ -242,7 +318,7 @@ export class RoomManager {
     this.broadcastRoom(room);
   }
 
-  private createRoom(socket: WebSocket): void {
+  private createRoom(socket: WebSocket, soVan?: number): void {
     const principal = this.principalOf(socket);
     if (!principal) {
       this.sendError(socket, 'UNAUTHENTICATED', 'cần đăng nhập');
@@ -254,6 +330,18 @@ export class RoomManager {
     }
     if (this.rooms.size >= (this.config.maxRooms ?? DEFAULT_MAX_ROOMS)) {
       this.sendError(socket, 'SERVER_FULL', 'server đã đạt giới hạn phòng');
+      return;
+    }
+    const { min: tourMin, max: tourMax, defaultCount: tourDefault } = rules.tour;
+    if (
+      soVan !== undefined &&
+      (!Number.isInteger(soVan) || soVan < tourMin || soVan > tourMax)
+    ) {
+      this.sendError(
+        socket,
+        'INVALID_TOUR_COUNT',
+        `số ván phải là số nguyên từ ${tourMin} đến ${tourMax}`,
+      );
       return;
     }
     const account = principal.username;
@@ -270,6 +358,7 @@ export class RoomManager {
     while (this.rooms.has(code)) code = makeRoomCode();
 
     const room = new Room(code);
+    room.soVan = soVan ?? tourDefault;
     const player: RoomPlayer = {
       seat: 0,
       account,
@@ -279,6 +368,7 @@ export class RoomManager {
       ready: false,
       connected: true,
       surrendered: false,
+      left: false,
       socket,
     };
     room.players.push(player);
@@ -286,6 +376,17 @@ export class RoomManager {
     this.rooms.set(code, room);
     this.bindings.set(socket, { room, player });
     this.sendRoom(room, player);
+  }
+
+  /** Tour đang trong vòng chơi (chưa tổng kết) — khoá ghế, không nhận người mới. */
+  private isTourActive(room: Room): boolean {
+    if (room.tourId === null) return false;
+    if (room.phase === 'playing') return true;
+    return (
+      room.tourPhase === 'running' ||
+      room.tourPhase === 'betweenRounds' ||
+      room.tourPhase === 'paused'
+    );
   }
 
   private joinRoom(socket: WebSocket, code: string): void {
@@ -303,11 +404,30 @@ export class RoomManager {
       this.sendError(socket, 'ROOM_NOT_FOUND', `không tìm thấy phòng ${code}`);
       return;
     }
-    if (room.phase !== 'lobby') {
+    const account = principal.username;
+    const tourActive = this.isTourActive(room);
+    if (tourActive && !rules.tour.allowMidJoin) {
+      // Quyết định 2026-11-05: tour đã bắt đầu thì không nhận người mới vào ghế trống.
+      const seated = room.players.some((player) => !player.left && player.account === account);
+      if (seated) {
+        // Không tạo ghế thứ hai cho cùng account; người có ghế phải reconnect bằng token.
+        this.sendError(
+          socket,
+          'ALREADY_IN_GAME',
+          'tài khoản đã có ghế trong tour này, hãy reconnect bằng token',
+        );
+        return;
+      }
+      this.sendError(socket, 'TOUR_IN_PROGRESS', 'Tour đang diễn ra, không thể vào giữa tour');
+      return;
+    }
+    const tourJoinable = tourActive && rules.tour.allowMidJoin && room.phase !== 'playing';
+    // Tour đã tổng kết: phòng coi như sảnh chờ tour mới nên vẫn nhận người vào ghế trống.
+    const tourFinished = room.tourId !== null && room.tourPhase === 'finished';
+    if (room.phase !== 'lobby' && !tourJoinable && !tourFinished) {
       this.sendError(socket, 'GAME_IN_PROGRESS', 'ván đã bắt đầu, không thể vào giữa ván');
       return;
     }
-    const account = principal.username;
     if (!this.claimAccount(account, socket)) {
       this.sendError(
         socket,
@@ -331,17 +451,35 @@ export class RoomManager {
       ready: false,
       connected: true,
       surrendered: false,
+      left: false,
       socket,
     };
     room.players.push(player);
     this.bindings.set(socket, { room, player });
+    if (room.tourId !== null && room.roundIndex > 0) {
+      // Vào sau khi tour đã chơi ít nhất 1 ván (chỉ còn cửa sổ sau tổng kết): điểm từ 0,
+      // cờ vào giữa tour, không kế thừa hạng ván trước.
+      const entry = this.ensureTourScore(room, player);
+      entry.joinedMid = true;
+      entry.left = false;
+      entry.pointsTotal = 0;
+      entry.wins = 0;
+      entry.chatThu = 0;
+      entry.chatTra = 0;
+      entry.thoiTra = 0;
+      entry.denTra = 0;
+      entry.roundsPlayed = 0;
+      entry.roundPoints = 0;
+      entry.lastPlace = null;
+      this.maybeResumeTour(room);
+    }
     this.sendRoom(room, player);
     this.broadcastRoom(room);
   }
 
   private firstFreeSeat(room: Room): number | null {
     for (let seat = 0; seat < MAX_SEATS; seat += 1) {
-      if (!room.players.some((player) => player.seat === seat)) return seat;
+      if (!room.players.some((player) => !player.left && player.seat === seat)) return seat;
     }
     return null;
   }
@@ -365,7 +503,7 @@ export class RoomManager {
     if (room.phase !== 'lobby') return;
     if (room.players.length < MIN_SEATS) return;
     if (!room.players.every((player) => player.ready)) return;
-    this.startGameInternal(room);
+    this.startTour(room, room.soVan);
   }
 
   private startGame(socket: WebSocket): void {
@@ -387,51 +525,129 @@ export class RoomManager {
       this.sendError(socket, 'NOT_ENOUGH_PLAYERS', 'cần ít nhất 2 người');
       return;
     }
-    this.startGameInternal(room);
+    this.startTour(room, room.soVan);
   }
 
-  private startGameInternal(room: Room): void {
+  /** doc-4 §3.1: chốt N → sinh `tour_id`, khóa số ván, chia VAN_1. */
+  private startTour(room: Room, soVan: number): void {
     if (room.phase !== 'lobby') return;
     if (room.players.length < MIN_SEATS) return;
-    room.players.sort((a, b) => a.seat - b.seat);
-    room.players.forEach((player, index) => {
+    const { min, max, defaultCount } = rules.tour;
+    const total = Number.isInteger(soVan) && soVan >= min && soVan <= max ? soVan : defaultCount;
+    const minPlayers = this.config.minPlayersToStart ?? rules.tour.minPlayersToStart;
+    if (room.players.length < minPlayers) return;
+
+    room.tourId = randomUUID();
+    room.soVan = total;
+    room.roundIndex = 0;
+    room.tourIncomplete = false;
+    room.tourPhase = 'running';
+    room.nextRoundAt = null;
+    this.clearTourTimer(room);
+    room.tourScores.clear();
+    room.previousPlaces.clear();
+    for (const player of room.players) {
+      player.left = false;
+      player.ready = false;
+      player.surrendered = false;
+    }
+    for (const player of room.players) this.ensureTourScore(room, player);
+    this.config.store?.createTour({
+      tourId: room.tourId,
+      roomCode: room.code,
+      totalRounds: total,
+      createdBy: room.players.find((player) => player.seat === room.hostSeat)?.nickname ?? '',
+    });
+    this.startRoundInternal(room, 1);
+  }
+
+  /** Chia 1 ván của tour; ghế được compact lại theo đúng người còn trong phòng. */
+  private startRoundInternal(room: Room, roundIndex: number): void {
+    const minPlayers = this.config.minPlayersToStart ?? rules.tour.minPlayersToStart;
+    this.dropLeftPlayers(room);
+    const present = room.players.filter((player) => !player.left);
+    if (present.length < minPlayers) {
+      this.pauseTour(room);
+      return;
+    }
+    present.sort((a, b) => a.seat - b.seat);
+    const hostAccount = room.players.find((player) => player.seat === room.hostSeat)?.account;
+    present.forEach((player, index) => {
       player.seat = index;
       player.ready = false;
       player.surrendered = false;
     });
-    room.hostSeat = 0;
+    const resolvedHost = hostAccount
+      ? present.find((player) => player.account === hostAccount)?.seat
+      : undefined;
+    room.hostSeat = resolvedHost ?? 0;
     room.rateHits.length = 0;
 
+    const previousRanking: Placement[] = [];
+    for (const player of present) {
+      const place = room.previousPlaces.get(player.account);
+      if (place) previousRanking.push({ seat: player.seat, place, cardsLeft: 0 });
+    }
+
     const seed = this.config.seed ?? randomInt(1, 2_147_483_647);
-    room.game = createGame({
+    const round = createRoundGame({
       seed,
-      players: room.players.length,
+      players: present.length,
       rules: engineRules(this.config),
+      roundIndex,
+      previousRanking,
+      presentSeats: present.map((player) => player.seat),
+      hostSeat: room.hostSeat,
       ...(this.config.hands ? { hands: this.config.hands } : {}),
-      ...(this.config.startingPlayerIndex === undefined
-        ? {}
-        : { startingPlayerIndex: this.config.startingPlayerIndex }),
+      ...(roundIndex === 1 && this.config.startingPlayerIndex !== undefined
+        ? { startingPlayerIndex: this.config.startingPlayerIndex }
+        : {}),
     });
-    room.phase = room.game.phase === 'finished' ? 'finished' : 'playing';
+
+    room.game = round.state;
+    room.phase = round.state.phase === 'finished' ? 'finished' : 'playing';
+    room.tourPhase = 'running';
+    room.roundIndex = roundIndex;
+    room.nextRoundAt = null;
+    this.clearTourTimer(room);
     room.turnDeadline = null;
     room.actionSeq = 0;
     room.resultRecorded = false;
+    room.matchFirstSeat = round.firstSeat;
+    room.matchFirstMoveFree = round.firstMoveFree;
     room.matchId =
       this.config.store?.createMatch({
         roomCode: room.code,
         seed,
         rulesVersion: rules.rulesVersion,
-        config: { windowMs: this.config.windowMs, turnMs: this.config.turnMs },
-        players: room.players.map((player) => ({
+        config: {
+          windowMs: this.config.windowMs,
+          turnMs: this.config.turnMs,
+          roundIndex,
+          firstSeat: round.firstSeat,
+          firstMoveFree: round.firstMoveFree,
+        },
+        players: present.map((player) => ({
           seat: player.seat,
           nickname: player.nickname,
           userId: player.userId,
         })),
+        tourId: room.tourId,
+        roundIndex,
       }) ?? null;
-    if (room.phase === 'finished') this.persistResult(room);
+    for (const entry of room.tourScores.values()) {
+      entry.roundPoints = 0;
+      entry.lastPlace = null;
+    }
     this.broadcastRoom(room);
     this.syncTimers(room);
     this.broadcastState(room);
+    if (room.phase === 'finished') {
+      // Tới trắng ngay sau chia: quyết toán luôn như ván đã kết thúc.
+      this.persistResult(room);
+      this.recordTourRound(room);
+      this.publishRoundEnd(room);
+    }
   }
 
   private handleIntent(
@@ -497,19 +713,87 @@ export class RoomManager {
   private applyResult(room: Room, state: GameState): void {
     this.clearTurnTimer(room);
     this.clearWindowTimer(room);
+    const previous = room.game;
     room.game = state;
-    if (state.phase === 'finished') {
+    const denEvents = this.newDenBaiEvents(previous, state);
+    const justFinished = state.phase === 'finished' && previous?.phase !== 'finished';
+    if (justFinished) {
       room.phase = 'finished';
       room.turnDeadline = null;
       this.clearAllTimers(room);
       this.persistResult(room);
+      this.recordTourRound(room);
     }
     this.syncTimers(room);
     this.broadcastState(room);
-    if (room.phase === 'finished') {
+    for (const event of denEvents) this.broadcastDenBai(room, event);
+    if (justFinished) {
       this.broadcastRoom(room);
-      this.maybeScheduleCleanup(room);
+      this.publishRoundEnd(room);
     }
+  }
+
+  /** Ghế vừa chuyển sang denOut sau action này (engine đã chốt đền). */
+  private newDenBaiEvents(
+    previous: GameState | null,
+    next: GameState,
+  ): readonly DenBaiView[] {
+    if (!previous) return [];
+    const to = next.ranking.find((entry) => entry.place === 'nhat')?.seat;
+    if (to === undefined) return [];
+    const events: DenBaiView[] = [];
+    for (const player of next.players) {
+      if (player.denOut !== true) continue;
+      if (previous.players[player.seat]?.denOut === true) continue;
+      events.push({
+        who: player.seat,
+        to,
+        points: this.denBaiPoints(next, player.seat),
+        reason: 'GIU_13_LA',
+      });
+    }
+    return events;
+  }
+
+  /** Cùng công thức scoring.ts: `den.giu13La` + giá trị heo/hàng còn trên tay. */
+  private denBaiPoints(game: GameState, seat: number): number {
+    const player = game.players[seat];
+    if (!player) return 0;
+    return (
+      game.rules.scoring.den.giu13La +
+      thoiPoints(player.hand, game.order, game.rules.scoring.values)
+    );
+  }
+
+  /** Toàn bộ ghế đền của ván (cho state/reconnect), rỗng khi chưa có Nhất. */
+  private denBaiViews(game: GameState): readonly DenBaiView[] {
+    const to = game.ranking.find((entry) => entry.place === 'nhat')?.seat;
+    if (to === undefined) return [];
+    return game.players
+      .filter((player) => player.denOut === true)
+      .map((player) => ({
+        who: player.seat,
+        to,
+        points: this.denBaiPoints(game, player.seat),
+        reason: 'GIU_13_LA' as const,
+      }));
+  }
+
+  /** Ghế đã chốt hạng (về Nhất/Nhì/Ba/Bét hoặc xin hàng) — không còn quyền đánh. */
+  private isPlaced(game: GameState, seat: number): boolean {
+    return game.ranking.some((entry) => entry.seat === seat);
+  }
+
+  /** Ghế còn thực sự trong ván: chưa xếp hạng, chưa rời, còn bài. */
+  private canAct(game: GameState, seat: number): boolean {
+    if (game.phase !== 'playing') return false;
+    if (!Number.isInteger(seat) || seat < 0 || seat >= game.players.length) return false;
+    const player = game.players[seat];
+    if (!player) return false;
+    // rev6 §1.7: ghế đền 13 lá đã ra khỏi ván — không lượt, không timeout/grace.
+    if (player.denOut === true) return false;
+    if (player.surrendered || player.hand.length === 0) return false;
+    return !this.isPlaced(game, seat);
   }
 
   private syncTimers(room: Room): void {
@@ -543,6 +827,12 @@ export class RoomManager {
       room.turnDeadline = null;
       return;
     }
+    // §1.7: không bao giờ hẹn giờ cho ghế đã hết bài/đã về — auto sẽ bắn nhầm.
+    if (!this.canAct(room.game, room.game.turn)) {
+      room.turnDeadline = null;
+      room.turnRemainingMs = null;
+      return;
+    }
     const remaining = Math.max(
       0,
       Math.min(room.turnRemainingMs ?? this.config.turnMs, this.config.turnMs),
@@ -558,6 +848,11 @@ export class RoomManager {
     if (room.turnDeadline !== deadline) return;
     const game = room.game;
     if (room.phase !== 'playing' || !game || game.phase !== 'playing') return;
+    // Ghế tới lượt vừa hết bài/rời trước khi timer chạy: bỏ qua, không auto cho ghế đó.
+    if (!this.canAct(game, game.turn)) {
+      this.syncTimers(room);
+      return;
+    }
     const seat = game.turn;
     const nowMs = Date.now();
     const result = applyTimeout(game, { nowMs });
@@ -621,6 +916,510 @@ export class RoomManager {
       actionCount: game.actionCount,
       rulesVersion: rules.rulesVersion,
     });
+  }
+
+  /** Lấy/tạo bản ghi điểm tour cho 1 người (khoá theo account, không theo ghế). */
+  private ensureTourScore(room: Room, player: RoomPlayer): TourScore {
+    const existing = room.tourScores.get(player.account);
+    if (existing) {
+      existing.nickname = player.nickname;
+      existing.seat = player.seat;
+      return existing;
+    }
+    const entry: TourScore = {
+      account: player.account,
+      nickname: player.nickname,
+      seat: player.seat,
+      joinedMid: room.roundIndex > 0,
+      left: false,
+      pointsTotal: 0,
+      wins: 0,
+      chatThu: 0,
+      chatTra: 0,
+      thoiTra: 0,
+      denTra: 0,
+      roundsPlayed: 0,
+      roundPoints: 0,
+      lastPlace: null,
+    };
+    room.tourScores.set(player.account, entry);
+    return entry;
+  }
+
+  /** doc-4 §5.1: cộng điểm ván vào điểm tour + thống kê chặt/thối/đền + hạng ván trước. */
+  private recordTourRound(room: Room): void {
+    const game = room.game;
+    if (!game || game.phase !== 'finished') return;
+    const score = calculateScore(game);
+    const bySeat = new Map<number, RoomPlayer>();
+    for (const player of room.players) bySeat.set(player.seat, player);
+    for (const entry of room.tourScores.values()) {
+      entry.roundPoints = 0;
+      entry.lastPlace = null;
+    }
+
+    const winnerSeat = game.ranking.find((entry) => entry.place === 'nhat')?.seat ?? null;
+    for (const player of room.players) {
+      if (player.left) continue;
+      const entry = this.ensureTourScore(room, player);
+      const delta = score.deltas[player.seat] ?? 0;
+      entry.roundPoints = delta;
+      entry.pointsTotal += delta;
+      entry.roundsPlayed += 1;
+      entry.lastPlace = game.ranking.find((row) => row.seat === player.seat)?.place ?? null;
+      if (winnerSeat === player.seat) entry.wins += 1;
+    }
+
+    for (const row of score.breakdown) {
+      if (row.type === 'chop' || row.type === 'chatChong') {
+        const payer = row.from === null ? undefined : bySeat.get(row.from);
+        if (payer) this.ensureTourScore(room, payer).chatTra += row.points;
+        const receiver = row.to === null ? undefined : bySeat.get(row.to);
+        if (receiver) this.ensureTourScore(room, receiver).chatThu += row.points;
+      } else if (row.type === 'thoi') {
+        const payer = row.from === null ? undefined : bySeat.get(row.from);
+        if (payer) this.ensureTourScore(room, payer).thoiTra += row.points;
+      } else if (row.type === 'denGiu13La') {
+        const payer = row.from === null ? undefined : bySeat.get(row.from);
+        if (payer) this.ensureTourScore(room, payer).denTra += row.points;
+      }
+    }
+
+    room.previousPlaces.clear();
+    for (const row of game.ranking) {
+      const player = bySeat.get(row.seat);
+      if (player) room.previousPlaces.set(player.account, row.place);
+    }
+
+    if (room.tourId === null) return;
+    const tourId = room.tourId;
+    for (const entry of room.tourScores.values()) {
+      this.config.store?.upsertTourScore({
+        tourId,
+        account: entry.account,
+        nickname: entry.nickname,
+        seat: this.liveSeatOf(room, entry),
+        pointsTotal: entry.pointsTotal,
+        wins: entry.wins,
+        chatThu: entry.chatThu,
+        chatTra: entry.chatTra,
+        thoiTra: entry.thoiTra,
+        denTra: entry.denTra,
+        roundsPlayed: entry.roundsPlayed,
+        joinedMid: entry.joinedMid,
+        leftMid: entry.left,
+      });
+    }
+  }
+
+  private liveSeatOf(room: Room, entry: TourScore): number {
+    return room.players.find((player) => player.account === entry.account)?.seat ?? entry.seat;
+  }
+
+  /** doc-4 §5.3: tổng điểm → số ván Nhất → (thối+đền) ít hơn → ghế nhỏ hơn. */
+  private rankedTourScores(room: Room): TourScore[] {
+    return [...room.tourScores.values()]
+      .filter((entry) => entry.roundsPlayed > 0 || entry.joinedMid || entry.left)
+      .sort((a, b) => {
+        if (b.pointsTotal !== a.pointsTotal) return b.pointsTotal - a.pointsTotal;
+        if (b.wins !== a.wins) return b.wins - a.wins;
+        const paidA = a.thoiTra + a.denTra;
+        const paidB = b.thoiTra + b.denTra;
+        if (paidA !== paidB) return paidA - paidB;
+        return this.liveSeatOf(room, a) - this.liveSeatOf(room, b);
+      });
+  }
+
+  private tourScoreView(room: Room, entry: TourScore): TourScoreView {
+    return {
+      seat: this.liveSeatOf(room, entry),
+      nickname: entry.nickname,
+      pointsTotal: entry.pointsTotal,
+      roundPoints: entry.roundPoints,
+      wins: entry.wins,
+      chatThu: entry.chatThu,
+      chatTra: entry.chatTra,
+      netChat: entry.chatThu - entry.chatTra,
+      thoiTra: entry.thoiTra,
+      denTra: entry.denTra,
+      roundsPlayed: entry.roundsPlayed,
+      joinedMid: entry.joinedMid,
+      left: entry.left,
+      lastPlace: entry.lastPlace,
+    };
+  }
+
+  /** Ghế chủ phòng sau khi compact ghế (dùng cho fallback luật đi trước). */
+  private compactHostSeat(room: Room, present: readonly RoomPlayer[]): number {
+    const host = room.players.find((player) => player.seat === room.hostSeat);
+    if (!host) return 0;
+    const index = present.findIndex((player) => player.account === host.account);
+    return index >= 0 ? index : 0;
+  }
+
+  /** Dự đoán "Nhất: <tên> đi trước ván tới" cho overlay KET_QUA_VAN. */
+  private nextFirstInfo(room: Room): {
+    seat: number | null;
+    nickname: string | null;
+    firstMoveFree: boolean;
+  } {
+    const minPlayers = this.config.minPlayersToStart ?? rules.tour.minPlayersToStart;
+    const present = room.players
+      .filter((player) => !player.left)
+      .slice()
+      .sort((a, b) => a.seat - b.seat);
+    if (present.length < minPlayers) return { seat: null, nickname: null, firstMoveFree: false };
+    const compacted = present.map((player, index) => ({ player, seat: index }));
+    const previousRanking: Placement[] = [];
+    for (const entry of compacted) {
+      const place = room.previousPlaces.get(entry.player.account);
+      if (place) previousRanking.push({ seat: entry.seat, place, cardsLeft: 0 });
+    }
+    const resolution = resolveFirstSeat({
+      roundIndex: room.roundIndex + 1,
+      playerCount: compacted.length,
+      previousRanking,
+      presentSeats: compacted.map((entry) => entry.seat),
+      hostSeat: this.compactHostSeat(room, present),
+      config: rules.firstPlayerSubsequent,
+    });
+    const target = compacted.find((entry) => entry.seat === resolution.firstSeat);
+    return {
+      seat: resolution.firstSeat,
+      nickname: target?.player.nickname ?? null,
+      firstMoveFree: resolution.firstMoveFree,
+    };
+  }
+
+  private buildTourResult(room: Room): ServerMessage {
+    const next = this.nextFirstInfo(room);
+    const result: TourResultView = {
+      tourId: room.tourId ?? '',
+      roundIndex: room.roundIndex,
+      soVan: room.soVan,
+      nextRoundIndex: room.roundIndex < room.soVan ? room.roundIndex + 1 : null,
+      nextRoundAt: room.nextRoundAt,
+      nextFirstSeat: next.seat,
+      nextFirstNickname: next.nickname,
+      nextFirstMoveFree: next.firstMoveFree,
+      scores: this.rankedTourScores(room).map((entry) => this.tourScoreView(room, entry)),
+    };
+    return { t: 'tourResult', result, serverNow: Date.now() };
+  }
+
+  private broadcastTourResult(room: Room): void {
+    const message = this.buildTourResult(room);
+    for (const player of room.players) {
+      if (player.socket) this.send(player.socket, message);
+    }
+  }
+
+  /** Reconnect vào phòng đang ở giữa tour: dựng lại overlay đúng trạng thái. */
+  private sendTourSnapshot(room: Room, player: RoomPlayer): void {
+    if (!player.socket || room.tourId === null) return;
+    if (room.tourPhase === 'betweenRounds' || room.tourPhase === 'paused') {
+      if (room.roundIndex > 0) this.send(player.socket, this.buildTourResult(room));
+      if (room.tourPhase === 'paused') this.send(player.socket, this.buildTourPaused(room));
+      return;
+    }
+    if (room.tourPhase === 'finished') this.send(player.socket, this.buildTourEnd(room));
+  }
+
+  private buildTourPaused(room: Room): ServerMessage {
+    const minPlayers = this.config.minPlayersToStart ?? rules.tour.minPlayersToStart;
+    const paused: TourPausedView = {
+      tourId: room.tourId ?? '',
+      roundIndex: room.roundIndex,
+      present: room.players.filter((player) => !player.left).length,
+      needed: minPlayers,
+      reason: 'thieu_nguoi',
+    };
+    return { t: 'tourPaused', paused, serverNow: Date.now() };
+  }
+
+  private buildTourEnd(room: Room): ServerMessage {
+    const ranked = this.rankedTourScores(room);
+    const rows: TourEndRowView[] = ranked.map((entry, index) => ({
+      ...this.tourScoreView(room, entry),
+      tourRank: index + 1,
+      tourPlace: turnRankPlace(index + 1),
+    }));
+    const summary: TourEndView = {
+      tourId: room.tourId ?? '',
+      soVan: room.soVan,
+      roundsPlayed: room.roundIndex,
+      incomplete: room.tourIncomplete,
+      rows,
+    };
+    return { t: 'tourEnd', summary, serverNow: Date.now() };
+  }
+
+  /**
+   * doc-4 §3.1: ván vừa xong → giữ phòng, phát bảng điểm + điểm tour, hẹn auto ván mới
+   * (hoặc TAM_DUNG khi thiếu người / TONG_KET_TOUR khi đủ N ván).
+   */
+  private publishRoundEnd(room: Room): void {
+    if (room.tourId === null) {
+      this.maybeScheduleCleanup(room);
+      return;
+    }
+    if (room.roundIndex >= room.soVan) {
+      this.finishTour(room, false);
+      return;
+    }
+    const minPlayers = this.config.minPlayersToStart ?? rules.tour.minPlayersToStart;
+    const present = room.players.filter((player) => !player.left).length;
+    if (present < minPlayers) {
+      this.pauseTour(room);
+      return;
+    }
+    const delay = this.config.tourResultDisplayMs ?? rules.tour.resultDisplayMs;
+    room.tourPhase = 'betweenRounds';
+    room.nextRoundAt = Date.now() + delay;
+    this.broadcastTourResult(room);
+    this.broadcastRoom(room);
+    const expectedAt = room.nextRoundAt;
+    this.clearTourTimer(room);
+    room.tourTimer = setTimeout(() => {
+      room.tourTimer = null;
+      if (this.rooms.get(room.code) !== room) return;
+      if (room.tourPhase !== 'betweenRounds' || room.nextRoundAt !== expectedAt) return;
+      // Không còn ai kết nối: không chia bài cho ghế ma, chuyển TAM_DUNG + dọn theo TTL.
+      if (!room.players.some((player) => player.connected && !player.left)) {
+        this.pauseTour(room);
+        return;
+      }
+      this.startRoundInternal(room, room.roundIndex + 1);
+    }, delay);
+  }
+
+  /** doc-4 §6: TAM_DUNG — chưa chia ván mới, chờ đủ người. */
+  private pauseTour(room: Room): void {
+    if (room.tourId === null) return;
+    this.clearTourTimer(room);
+    room.tourPhase = 'paused';
+    room.nextRoundAt = null;
+    room.phase = 'finished';
+    const message = this.buildTourPaused(room);
+    for (const player of room.players) {
+      if (player.socket) this.send(player.socket, message);
+    }
+    this.broadcastRoom(room);
+    this.maybeScheduleCleanup(room);
+  }
+
+  /** TAM_DUNG → đếm ngược 3s → VAN_(i+1) khi đã đủ người. */
+  private maybeResumeTour(room: Room): void {
+    if (room.tourId === null || room.tourPhase !== 'paused') return;
+    const minPlayers = this.config.minPlayersToStart ?? rules.tour.minPlayersToStart;
+    if (room.players.filter((player) => !player.left).length < minPlayers) return;
+    const delay = this.config.tourResumeMs ?? rules.tour.resumeCountdownMs;
+    room.tourPhase = 'betweenRounds';
+    room.nextRoundAt = Date.now() + delay;
+    this.broadcastRoom(room);
+    const expectedAt = room.nextRoundAt;
+    this.clearTourTimer(room);
+    room.tourTimer = setTimeout(() => {
+      room.tourTimer = null;
+      if (this.rooms.get(room.code) !== room) return;
+      if (room.tourPhase !== 'betweenRounds' || room.nextRoundAt !== expectedAt) return;
+      if (!room.players.some((player) => player.connected && !player.left)) {
+        this.pauseTour(room);
+        return;
+      }
+      this.startRoundInternal(room, room.roundIndex + 1);
+    }, delay);
+  }
+
+  /** doc-4 §3.1: đủ N ván (hoặc chủ phòng dừng sớm) → bảng tổng kết, dừng auto. */
+  private finishTour(room: Room, incomplete: boolean): void {
+    this.clearTourTimer(room);
+    room.tourPhase = 'finished';
+    room.tourIncomplete = incomplete;
+    room.nextRoundAt = null;
+    room.phase = 'finished';
+    if (room.tourId !== null) {
+      this.config.store?.finishTour(
+        room.tourId,
+        incomplete ? 'incomplete' : 'finished',
+        room.roundIndex,
+      );
+    }
+    const ranked = this.rankedTourScores(room);
+    const rows: TourEndRowView[] = ranked.map((entry, index) => ({
+      ...this.tourScoreView(room, entry),
+      tourRank: index + 1,
+      tourPlace: turnRankPlace(index + 1),
+    }));
+    const summary: TourEndView = {
+      tourId: room.tourId ?? '',
+      soVan: room.soVan,
+      roundsPlayed: room.roundIndex,
+      incomplete,
+      rows,
+    };
+    const message: ServerMessage = { t: 'tourEnd', summary, serverNow: Date.now() };
+    for (const player of room.players) {
+      if (player.socket) this.send(player.socket, message);
+    }
+    this.broadcastRoom(room);
+    this.maybeScheduleCleanup(room);
+  }
+  /**
+   * doc-4 §6: rời tour → ghế trống ngay, điểm tour của họ không bảo lưu khi quay lại;
+   * bảng tổng kết vẫn liệt kê với cờ `left`.
+   */
+  private releaseSeat(room: Room, player: RoomPlayer): void {
+    if (player.left) return;
+    player.left = true;
+    const entry = room.tourScores.get(player.account);
+    if (entry) {
+      entry.left = true;
+      if (room.tourId !== null) {
+        this.config.store?.upsertTourScore({
+          tourId: room.tourId,
+          account: entry.account,
+          nickname: entry.nickname,
+          seat: entry.seat,
+          pointsTotal: entry.pointsTotal,
+          wins: entry.wins,
+          chatThu: entry.chatThu,
+          chatTra: entry.chatTra,
+          thoiTra: entry.thoiTra,
+          denTra: entry.denTra,
+          roundsPlayed: entry.roundsPlayed,
+          joinedMid: entry.joinedMid,
+          leftMid: true,
+        });
+      }
+    }
+    if (room.hostSeat === player.seat) {
+      const nextHost = room.players.find((other) => other !== player && !other.left);
+      room.hostSeat = nextHost?.seat ?? 0;
+    }
+    // Giữ player + socket tới hết ván để họ vẫn nhận bảng điểm/tổng kết; ghế thực sự
+    // được giải phóng ở `dropLeftPlayers` khi chia ván kế tiếp.
+    player.connected = false;
+    this.broadcastRoom(room);
+    if (room.phase === 'playing') return;
+    if (room.tourId === null) return;
+    const minPlayers = this.config.minPlayersToStart ?? rules.tour.minPlayersToStart;
+    if (room.players.filter((other) => !other.left).length < minPlayers) {
+      if (room.tourPhase !== 'finished') this.pauseTour(room);
+      return;
+    }
+    this.maybeResumeTour(room);
+  }
+
+  /** Bỏ hẳn người đã rời khỏi danh sách ghế trước khi chia ván mới. */
+  private dropLeftPlayers(room: Room): void {
+    for (const player of [...room.players]) {
+      if (!player.left) continue;
+      const index = room.players.indexOf(player);
+      if (index >= 0) room.players.splice(index, 1);
+      const socket = player.socket;
+      if (socket) {
+        this.bindings.delete(socket);
+        if (this.accountSockets.get(player.account) === socket) {
+          this.accountSockets.delete(player.account);
+        }
+      }
+      player.socket = null;
+    }
+  }
+
+  private leaveTour(socket: WebSocket): void {
+    const binding = this.bindings.get(socket);
+    if (!binding) {
+      this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
+      return;
+    }
+    const { room, player } = binding;
+    if (room.tourId === null) {
+      this.sendError(socket, 'NO_TOUR', 'phòng chưa mở tour');
+      return;
+    }
+    this.markLeft(room, player);
+    this.releaseSeat(room, player);
+    this.maybeScheduleCleanup(room);
+  }
+
+  private endTour(socket: WebSocket): void {
+    const binding = this.bindings.get(socket);
+    if (!binding) {
+      this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
+      return;
+    }
+    const { room, player } = binding;
+    if (room.tourId === null) {
+      this.sendError(socket, 'NO_TOUR', 'phòng chưa mở tour');
+      return;
+    }
+    if (!rules.tour.earlyEndByHost) {
+      this.sendError(socket, 'EARLY_END_DISABLED', 'kết thúc sớm đang tắt');
+      return;
+    }
+    if (player.seat !== room.hostSeat) {
+      this.sendError(socket, 'NOT_HOST', 'chỉ chủ phòng được kết thúc sớm');
+      return;
+    }
+    if (room.tourPhase !== 'betweenRounds' && room.tourPhase !== 'paused') {
+      this.sendError(socket, 'TOUR_NOT_PAUSED', 'chỉ kết thúc sớm khi giữa các ván');
+      return;
+    }
+    this.finishTour(room, true);
+  }
+
+  /** doc-4 §3.1: TONG_KET_TOUR → tour mới cùng ghế, điểm từ 0, `tour_id` mới. */
+  private newTour(socket: WebSocket, soVan?: number): void {
+    const binding = this.bindings.get(socket);
+    if (!binding) {
+      this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
+      return;
+    }
+    const { room, player } = binding;
+    if (room.tourId === null || room.tourPhase !== 'finished') {
+      this.sendError(socket, 'TOUR_NOT_FINISHED', 'chỉ tạo tour mới sau khi tổng kết');
+      return;
+    }
+    if (player.seat !== room.hostSeat) {
+      this.sendError(socket, 'NOT_HOST', 'chỉ chủ phòng được mở tour mới');
+      return;
+    }
+    const minPlayers = this.config.minPlayersToStart ?? rules.tour.minPlayersToStart;
+    if (room.players.filter((other) => !other.left).length < minPlayers) {
+      this.sendError(socket, 'NOT_ENOUGH_PLAYERS', 'cần ít nhất 2 người');
+      return;
+    }
+    const { min, max } = rules.tour;
+    const total =
+      typeof soVan === 'number' && Number.isInteger(soVan) && soVan >= min && soVan <= max
+        ? soVan
+        : room.soVan;
+    room.phase = 'lobby';
+    room.tourPhase = null;
+    room.tourId = null;
+    room.roundIndex = 0;
+    room.game = null;
+    room.matchId = null;
+    this.startTour(room, total);
+  }
+
+  private clearTourTimer(room: Room): void {
+    if (!room.tourTimer) return;
+    clearTimeout(room.tourTimer);
+    room.tourTimer = null;
+  }
+
+  private tourView(room: Room): TourView {
+    return {
+      tourId: room.tourId ?? '',
+      soVan: room.soVan,
+      roundIndex: room.roundIndex,
+      phase: room.tourPhase ?? 'running',
+      nextRoundAt: room.nextRoundAt,
+      ...(room.tourIncomplete ? { incomplete: true } : {}),
+    };
   }
 
   private isRateLimited(room: Room): boolean {
@@ -697,6 +1496,7 @@ export class RoomManager {
         if (other !== player) this.sendState(room, other);
       }
     }
+    this.sendTourSnapshot(room, player);
   }
 
   private handleClose(socket: WebSocket): void {
@@ -715,10 +1515,19 @@ export class RoomManager {
       return;
     }
 
+    // doc-4 §6: rời ở KET_QUA_VAN / TAM_DUNG / TONG_KET_TOUR → ghế trống ngay.
+    if (room.tourId !== null && room.phase !== 'playing') {
+      this.releaseSeat(room, player);
+      this.maybeScheduleCleanup(room);
+      return;
+    }
+
     this.broadcastRoom(room);
     this.broadcastState(room);
     this.maybeScheduleCleanup(room);
     if (room.phase !== 'playing' || !room.game || room.game.phase !== 'playing') return;
+    // Ghế đã về/hết bài: giữ nguyên token để còn reconnect xem kết quả, không xử thua.
+    if (!this.canAct(room.game, player.seat)) return;
     if (room.game.turn === player.seat) this.scheduleGrace(room, player);
     this.scheduleExpiry(room, player);
   }
@@ -744,6 +1553,7 @@ export class RoomManager {
     player.surrendered = true;
     this.clearGrace(room, player.seat);
     this.clearExpiry(room, player.seat);
+    if (room.tourId !== null) this.releaseSeat(room, player);
   }
 
   private scheduleGrace(room: Room, player: RoomPlayer): void {
@@ -755,6 +1565,8 @@ export class RoomManager {
       const game = room.game;
       if (room.phase !== 'playing' || !game || game.phase !== 'playing') return;
       if (game.turn !== seat) return;
+      // Ghế đã về (hết bài) thì không auto-pass/auto-play thay họ.
+      if (!this.canAct(game, seat)) return;
       // §3.2: mất kết nối đang tới lượt → sau 10s auto như timeout.
       const nowMs = Date.now();
       const result = applyTimeout(game, { nowMs });
@@ -771,11 +1583,14 @@ export class RoomManager {
     const timer = setTimeout(() => {
       room.expiryTimers.delete(seat);
       if (player.connected || player.surrendered) return;
+      const game = room.game;
+      // Ghế đã về hạng hoặc ván đã xong: giữ token reconnect để xem kết quả,
+      // không biến họ thành "đã rời ván" sau khi đã chốt hạng.
+      if (room.phase !== 'playing' || !game || game.phase !== 'playing') return;
+      if (!this.canAct(game, seat)) return;
       // Quá hạn reconnect = rời ván vĩnh viễn. Set cờ TRƯỚC khi gọi engine để token
       // vẫn bị vô hiệu kể cả khi engine trả ALREADY_SURRENDERED / ván đã kết thúc.
       this.markLeft(room, player);
-      const game = room.game;
-      if (room.phase !== 'playing' || !game || game.phase !== 'playing') return;
       const intent: Intent = { type: 'surrender', seat };
       const nowMs = Date.now();
       const result = applyIntent(game, intent, { nowMs });
@@ -819,6 +1634,7 @@ export class RoomManager {
   private clearAllTimers(room: Room): void {
     this.clearTurnTimer(room);
     this.clearWindowTimer(room);
+    this.clearTourTimer(room);
     this.cancelCleanup(room);
     for (const timer of room.graceTimers.values()) clearTimeout(timer);
     room.graceTimers.clear();
@@ -851,8 +1667,18 @@ export class RoomManager {
 
   private deleteRoom(room: Room): void {
     this.clearAllTimers(room);
+    if (room.tourId !== null && room.tourPhase !== 'finished') {
+      // Phòng bị dọn giữa tour (hết TTL, không còn ai): đóng tour để không treo status running.
+      this.config.store?.finishTour(room.tourId, 'incomplete', room.roundIndex);
+    }
     room.game = null;
     room.matchId = null;
+    room.tourId = null;
+    room.tourPhase = null;
+    room.roundIndex = 0;
+    room.nextRoundAt = null;
+    room.tourScores.clear();
+    room.previousPlaces.clear();
     this.rooms.delete(room.code);
     for (const [socket, binding] of this.bindings) {
       if (binding.room !== room) continue;
@@ -884,6 +1710,13 @@ export class RoomManager {
 
   private broadcastState(room: Room): void {
     for (const player of room.players) this.sendState(room, player);
+  }
+
+  private broadcastDenBai(room: Room, event: DenBaiView): void {
+    const message: ServerMessage = { t: 'denBai', event, serverNow: Date.now() };
+    for (const player of room.players) {
+      if (player.socket) this.send(player.socket, message);
+    }
   }
 
   private sendState(room: Room, player: RoomPlayer, options: { includeLog?: boolean } = {}): void {
@@ -957,6 +1790,7 @@ export class RoomManager {
       maxSeats: MAX_SEATS,
       phase: room.phase,
       players: room.players
+        .filter((player) => !player.left)
         .slice()
         .sort((a, b) => a.seat - b.seat)
         .map((player) => ({
@@ -966,6 +1800,7 @@ export class RoomManager {
           connected: player.connected,
           isHost: player.seat === room.hostSeat,
         })),
+      ...(room.tourId !== null ? { tour: this.tourView(room) } : {}),
       you: { seat: viewer.seat, token: viewer.token },
     };
   }
@@ -984,6 +1819,7 @@ export class RoomManager {
           ready: player.ready,
           connected: player.connected,
           surrendered: false,
+          denOut: false,
         })),
         table: null,
         trick: { id: 0, leader: -1, passed: [] },
@@ -992,6 +1828,9 @@ export class RoomManager {
         turnDeadline: null,
         chopWindow: null,
         lastActionId: null,
+        ...(room.roundIndex > 0
+          ? { roundIndex: room.roundIndex, firstMoveFree: false, firstSeat: -1 }
+          : {}),
         serverNow: Date.now(),
       };
     }
@@ -1006,14 +1845,13 @@ export class RoomManager {
         }
       : null;
 
-    const ranking: RankingView[] | null =
-      game.phase === 'finished'
-        ? game.ranking.map((entry) => ({
-            seat: entry.seat,
-            place: entry.place,
-            cardsLeft: entry.cardsLeft,
-          }))
-        : null;
+    // Hạng đã chốt luôn được công bố, kể cả khi ván còn chơi tiếp sau Nhất.
+    const ranking: RankingView[] = game.ranking.map((entry) => ({
+      seat: entry.seat,
+      place: entry.place,
+      cardsLeft: entry.cardsLeft,
+    }));
+    const placedSeats = new Set(ranking.map((entry) => entry.seat));
 
     const score = game.phase === 'finished' ? calculateScore(game) : null;
     const scores = score?.deltas ?? null;
@@ -1027,6 +1865,8 @@ export class RoomManager {
           targetBy: game.chopWindow.targetBy,
         }
       : null;
+
+    const denBai = this.denBaiViews(game);
 
     return {
       rulesVersion: rules.rulesVersion,
@@ -1044,6 +1884,8 @@ export class RoomManager {
             ready: player.ready,
             connected: player.connected,
             surrendered: gamePlayer?.surrendered ?? false,
+            placed: placedSeats.has(player.seat),
+            denOut: gamePlayer?.denOut === true,
           };
         }),
       table,
@@ -1051,9 +1893,13 @@ export class RoomManager {
       ranking,
       scores,
       ...(score ? { breakdown: score.breakdown } : {}),
+      ...(denBai.length > 0 ? { denBai } : {}),
       turnDeadline: room.turnDeadline,
       chopWindow,
       lastActionId: game.lastActionId,
+      roundIndex: game.roundIndex,
+      firstMoveFree: game.firstMoveFree,
+      firstSeat: game.startingPlayerIndex,
       serverNow: Date.now(),
     };
   }

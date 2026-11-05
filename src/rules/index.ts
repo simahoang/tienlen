@@ -10,6 +10,7 @@ export * from './toiTrang';
 export * from './game';
 export * from './scoring';
 export * from './replay';
+export * from './tour';
 
 export function isValidRulesVersion(version: string): boolean {
   return SEMVER_PATTERN.test(version);
