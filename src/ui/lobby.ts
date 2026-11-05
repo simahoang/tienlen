@@ -1,4 +1,5 @@
 import type { ConnectionStatus } from '../net/client';
+import { MAX_SPECTATORS, type RoomSummaryView } from '../net/protocol';
 import { escapeHtml } from './dom';
 import { formatConnectionStatus } from './errors';
 import { TOUR_DEFAULT, TOUR_PRESETS, resolveTourCount, tourCountHint, validateTourCountInput } from './tour';
@@ -18,6 +19,8 @@ export interface LobbyActions {
   start(): void;
   retryConnection(): void;
   logout(): void;
+  /** Xin lại danh sách phòng đang mở (nút Thử lại của sảnh). */
+  listRooms(): void;
   onNicknameChange(value: string): void;
   onCodeChange(value: string): void;
   onTourCountChange(value: string): void;
@@ -38,6 +41,10 @@ export interface LobbyRenderState {
   readonly reloginUrl: string | null;
   /** Nhãn nút relogin (vd: "Mở lại ở tab này" khi bị tab khác chiếm phiên). */
   readonly reloginLabel: string;
+  /** Danh sách phòng đang mở; null = đang tải / chưa có dữ liệu. */
+  readonly roomList: readonly RoomSummaryView[] | null;
+  /** Lỗi khi tải danh sách phòng (nếu có) — hiện kèm nút Thử lại. */
+  readonly roomListError: string | null;
 }
 
 function connectionBanner(status: ConnectionStatus, attempt: number): string {
@@ -142,6 +149,97 @@ function tourCountField(state: LobbyRenderState): string {
     </fieldset>`;
 }
 
+const PHASE_LABELS: Readonly<Record<RoomSummaryView['phase'], string>> = {
+  lobby: 'Chờ',
+  playing: 'Đang chơi',
+  finished: 'Kết thúc',
+};
+
+function roundsLabel(room: RoomSummaryView): string | null {
+  if (room.soVan === null) return null;
+  const current = room.roundIndex ?? 0;
+  return current > 0 ? `Ván ${current}/${room.soVan}` : `${room.soVan} ván`;
+}
+
+function roomRowMarkup(room: RoomSummaryView, state: LobbyRenderState): string {
+  const online = state.status === 'open';
+  const code = escapeHtml(room.code);
+  const rounds = roundsLabel(room);
+  const spectators = room.spectatorCount > 0 ? `${room.spectatorCount} khán giả` : '0 khán giả';
+  let action: string;
+  if (room.canJoin) {
+    action = `<button class="btn btn--primary room-row__action" type="button"
+      data-testid="room-join-${code}" data-room-code="${code}"${online ? '' : ' disabled'}>Vào chơi</button>`;
+  } else {
+    const full = room.spectatorCount >= MAX_SPECTATORS;
+    action = `<button class="btn btn--ghost room-row__action" type="button"
+      data-testid="room-watch-${code}" data-room-code="${code}"
+      title="${full ? 'Phòng đã đủ khán giả' : 'Vào xem bàn đang chơi'}"
+      ${full || !online ? 'disabled' : ''}>Vào xem</button>`;
+  }
+  return `<li class="room-row" data-testid="room-row-${code}">
+    <div class="room-row__main">
+      <span class="room-row__code">${code}</span>
+      <span class="room-row__host" title="Chủ phòng">${
+        room.hostNickname.length > 0 ? escapeHtml(room.hostNickname) : 'Chưa rõ chủ phòng'
+      }</span>
+      <span class="room-row__meta">
+        <span class="badge">${room.playerCount}/${room.maxSeats}</span>
+        <span class="badge badge--phase badge--phase-${room.phase}" data-testid="room-phase-${code}">${
+          PHASE_LABELS[room.phase]
+        }</span>
+        <span class="badge">${spectators}</span>
+      </span>
+      ${
+        rounds === null
+          ? ''
+          : `<span class="badge room-row__tour" data-testid="room-tour-${code}">${escapeHtml(rounds)}</span>`
+      }
+    </div>
+    <div class="room-row__actions">${action}</div>
+  </li>`;
+}
+
+function roomListMarkup(state: LobbyRenderState): string {
+  const head = `<div class="room-list__head">
+      <h2 class="room-list__title">Phòng đang mở</h2>
+      <span class="room-list__hint">Bấm vào phòng để vào nhanh</span>
+    </div>`;
+  if (state.roomListError !== null) {
+    return `<section class="room-list" data-testid="room-list" aria-label="Phòng đang mở">
+      ${head}
+      <p class="msg msg--error" role="alert" data-testid="room-list-error">${escapeHtml(state.roomListError)}</p>
+      <button class="btn btn--ghost" type="button" data-testid="room-list-retry">Thử lại</button>
+    </section>`;
+  }
+  if (state.roomList === null) {
+    const rows = Array.from(
+      { length: 3 },
+      () => `<li class="room-row room-row--skeleton" aria-hidden="true">
+        <span class="room-row__skeleton-line"></span>
+        <span class="room-row__skeleton-line room-row__skeleton-line--short"></span>
+      </li>`,
+    ).join('');
+    return `<section class="room-list" data-testid="room-list" aria-label="Phòng đang mở"
+      aria-busy="true">
+      ${head}
+      <ul class="room-list__rows">${rows}</ul>
+      <p class="hint" role="status">Đang tải danh sách phòng…</p>
+    </section>`;
+  }
+  if (state.roomList.length === 0) {
+    return `<section class="room-list" data-testid="room-list" aria-label="Phòng đang mở">
+      ${head}
+      <p class="hint room-list__empty" data-testid="room-list-empty">Không có phòng nào — hãy tạo phòng mới.</p>
+    </section>`;
+  }
+  const rows = state.roomList.map((room) => roomRowMarkup(room, state)).join('');
+  return `<section class="room-list" data-testid="room-list" aria-label="Phòng đang mở">
+    ${head}
+    <ul class="room-list__rows">${rows}</ul>
+  </section>`;
+}
+
 function entryMarkup(state: LobbyRenderState): string {
   const authed = state.authName !== null;
   const online = state.status === 'open';
@@ -168,6 +266,7 @@ function entryMarkup(state: LobbyRenderState): string {
       ${tourCountField(state)}
       <button id="create-room" class="btn btn--primary" type="button"
         data-testid="create-room"${createDisabled}>Tạo phòng</button>
+      ${roomListMarkup(state)}
       <div class="divider"><span>hoặc vào phòng có sẵn</span></div>
       <label class="field" for="room-code">
         <span class="field__label">Mã phòng</span>
@@ -275,6 +374,18 @@ function bind(mount: HTMLElement, state: LobbyRenderState, actions: LobbyActions
 
   mount.querySelector<HTMLButtonElement>('#retry')?.addEventListener('click', () => {
     actions.retryConnection();
+  });
+
+  mount.querySelector<HTMLButtonElement>('[data-testid="room-list-retry"]')?.addEventListener('click', () => {
+    actions.listRooms();
+  });
+
+  mount.querySelectorAll<HTMLButtonElement>('.room-row__action').forEach((button) => {
+    const code = button.dataset['roomCode'] ?? '';
+    button.addEventListener('click', () => {
+      if (code.length === 0) return;
+      actions.joinRoom(code, state.form.nickname);
+    });
   });
 
   mount.querySelector<HTMLButtonElement>('#logout')?.addEventListener('click', () => {

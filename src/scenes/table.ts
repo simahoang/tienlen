@@ -10,8 +10,8 @@ import type {
 } from '../net/protocol';
 import { activateDialog } from '../ui/dom';
 import { formatConnectionStatus } from '../ui/errors';
+import { orderedHand } from '../ui/hand-order';
 import { buildResultRows, formatPlace, formatPoints, type BreakdownEntry } from '../ui/result';
-import { sortCards } from '../ui/table-logic';
 import { formatCountdown } from '../ui/timer';
 import { buildRoundBanner, isTourResultStale } from '../ui/tour';
 import type { TableSeatView, TableViewModel } from '../ui/view-model';
@@ -46,12 +46,21 @@ export interface TableTourRenderState {
 
 export interface TableActions {
   toggleCard(cardId: string): void;
+  /** Thả lá vào vị trí `toIndex` trong danh sách đã bỏ lá đang kéo. */
+  reorderCard(cardId: string, toIndex: number): void;
+  /** Dịch lá ±1 vị trí (bàn phím Alt+←/→). */
+  moveCardBy(cardId: string, delta: number): void;
+  resetHandOrder(): void;
   play(): void;
   pass(): void;
   surrender(): void;
   chop(): void;
   toggleMute(): void;
   leaveRoom(): void;
+  /** Khán giả thoát xem, giữ kết nối và về sảnh. */
+  leaveWatch(): void;
+  /** Khán giả xin vào ghế trống (phòng lobby còn chỗ). */
+  takeSeat(): void;
   leaveTour(): void;
   endTour(): void;
   newTour(soVan: number): void;
@@ -63,6 +72,8 @@ export interface TableRenderState {
   readonly reconnectAttempt: number;
   readonly selectedIds: ReadonlySet<string>;
   readonly hand: readonly CardView[];
+  /** Thứ tự thủ công (card id) do người chơi tự sắp; rỗng = thứ tự mặc định. */
+  readonly handOrder: readonly string[];
   readonly playable: boolean;
   readonly playHint: string;
   readonly canPass: boolean;
@@ -100,14 +111,41 @@ function isRed(card: CardView): boolean {
   return card.suit === 'hearts' || card.suit === 'diamonds';
 }
 
-function tableCard(card: CardView): HTMLElement {
+function tableCard(card: CardView, testid?: string): HTMLElement {
   const node = element('span', `card-mini${isRed(card) ? ' card-mini--red' : ''}`);
   node.setAttribute('aria-label', `${card.rank} ${suitSymbol(card)}`);
+  if (testid !== undefined) node.dataset['testid'] = testid;
   node.append(
     text('span', rules.deck.rankLabels[card.rank], 'card-mini__rank'),
     text('span', suitSymbol(card), 'card-mini__suit'),
   );
   return node;
+}
+
+/** Ngưỡng di chuyển (px) để phân biệt chạm chọn bài và kéo sắp xếp. */
+const DRAG_THRESHOLD = 8;
+
+/** Vị trí chèn trong danh sách đã bỏ lá đang kéo, tính theo tâm lá dưới con trỏ. */
+function dropIndexFor(button: HTMLButtonElement, clientX: number): number {
+  const cards = button.parentElement?.querySelectorAll<HTMLElement>('.hand-card');
+  if (cards === undefined) return 0;
+  let index = 0;
+  for (const node of cards) {
+    if (node === button) continue;
+    const rect = node.getBoundingClientRect();
+    if (clientX > rect.left + rect.width / 2) index += 1;
+  }
+  return index;
+}
+
+/** Cuộn ngang khi kéo tới sát mép để với tới lá ngoài màn hình. */
+function autoScrollCards(button: HTMLButtonElement, clientX: number): void {
+  const container = button.closest<HTMLElement>('.hand__cards');
+  if (container === null) return;
+  const rect = container.getBoundingClientRect();
+  const edge = 36;
+  if (clientX < rect.left + edge) container.scrollLeft -= 10;
+  else if (clientX > rect.right - edge) container.scrollLeft += 10;
 }
 
 function handCard(card: CardView, selected: boolean, actions: TableActions): HTMLButtonElement {
@@ -121,9 +159,82 @@ function handCard(card: CardView, selected: boolean, actions: TableActions): HTM
     text('span', rules.deck.rankLabels[card.rank], `hand-card__rank${red}`),
     text('span', suitSymbol(card), `hand-card__suit${red}`),
   );
-  button.addEventListener('click', () => {
+
+  let pointerId: number | null = null;
+  let startX = 0;
+  let startY = 0;
+  let dragging = false;
+  let clickGuardUntil = 0;
+
+  const endDrag = (): void => {
+    dragging = false;
+    button.classList.remove('hand-card--dragging');
+    button.style.transform = '';
+    document.body.classList.remove('is-dragging-card');
+  };
+
+  button.addEventListener('pointerdown', (event) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    pointerId = event.pointerId;
+    startX = event.clientX;
+    startY = event.clientY;
+    dragging = false;
+  });
+
+  button.addEventListener('pointermove', (event) => {
+    if (pointerId !== event.pointerId) return;
+    const dx = event.clientX - startX;
+    const dy = event.clientY - startY;
+    if (!dragging) {
+      if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
+      // Vuốt dọc chiếm ưu thế: nhường cho trình duyệt cuộn trang.
+      if (Math.abs(dy) > Math.abs(dx)) {
+        pointerId = null;
+        return;
+      }
+      dragging = true;
+      button.setPointerCapture(event.pointerId);
+      button.classList.add('hand-card--dragging');
+      document.body.classList.add('is-dragging-card');
+    }
+    event.preventDefault();
+    const lift = selected ? -18 : -6;
+    button.style.transform = `translate(${dx}px, ${lift}px) scale(1.04)`;
+    autoScrollCards(button, event.clientX);
+  });
+
+  button.addEventListener('pointerup', (event) => {
+    if (pointerId !== event.pointerId) return;
+    pointerId = null;
+    if (!dragging) return;
+    const toIndex = dropIndexFor(button, event.clientX);
+    // Click vẫn bắn sau pointerup: chặn để không toggle selection sau khi thả.
+    clickGuardUntil = performance.now() + 250;
+    endDrag();
+    actions.reorderCard(card.id, toIndex);
+  });
+
+  button.addEventListener('pointercancel', () => {
+    pointerId = null;
+    if (dragging) endDrag();
+  });
+
+  button.addEventListener('click', (event) => {
+    if (performance.now() < clickGuardUntil) {
+      event.preventDefault();
+      return;
+    }
     actions.toggleCard(card.id);
   });
+
+  // Alt+←/→ (hoặc Shift+←/→ khi trình duyệt chiếm Alt) đổi chỗ lá đang focus.
+  button.addEventListener('keydown', (event) => {
+    if (!event.altKey && !event.shiftKey) return;
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    event.preventDefault();
+    actions.moveCardBy(card.id, event.key === 'ArrowLeft' ? -1 : 1);
+  });
+
   return button;
 }
 
@@ -285,11 +396,12 @@ function resultOverlay(state: TableRenderState, actions: TableActions): HTMLElem
   }
 
   const actionsRow = element('div', 'result-overlay__actions');
-  const leave = text('button', 'Về sảnh', 'btn btn--primary');
+  const leave = text('button', view.isSpectator ? 'Thoát xem' : 'Về sảnh', 'btn btn--primary');
   leave.type = 'button';
-  leave.dataset['testid'] = 'leave-room';
+  leave.dataset['testid'] = view.isSpectator ? 'leave-watch' : 'leave-room';
   leave.addEventListener('click', () => {
-    actions.leaveRoom();
+    if (view.isSpectator) actions.leaveWatch();
+    else actions.leaveRoom();
   });
   actionsRow.append(leave);
 
@@ -305,6 +417,8 @@ export function renderTable(
 ): void {
   const { view } = state;
   const online = state.status === 'open';
+  // Render lại giữa lúc kéo sẽ thay DOM: gỡ trạng thái kéo còn sót.
+  document.body.classList.remove('is-dragging-card');
   const screen = element('section', 'screen screen--table');
 
   const head = element('header', 'table-head');
@@ -322,6 +436,12 @@ export function renderTable(
     tourChip.dataset['testid'] = 'tour-round-chip';
     headRight.append(tourChip);
   }
+  if (view.isSpectator || view.spectatorCount > 0) {
+    const spectators = text('span', `${view.spectatorCount} khán giả`, 'pill pill--spectators');
+    spectators.dataset['testid'] = 'spectator-count';
+    spectators.setAttribute('aria-label', `${view.spectatorCount} khán giả đang xem`);
+    headRight.append(spectators);
+  }
   const mute = text('button', state.muted ? 'Bật tiếng' : 'Tắt tiếng', 'btn btn--tiny');
   mute.type = 'button';
   mute.dataset['testid'] = 'mute';
@@ -334,6 +454,37 @@ export function renderTable(
 
   const connection = connectionBanner(state.status, state.reconnectAttempt);
   if (connection !== null) screen.append(connection);
+
+  if (view.isSpectator) {
+    const banner = element('section', 'spectator-banner');
+    banner.dataset['testid'] = 'spectator-banner';
+    banner.setAttribute('role', 'status');
+    banner.append(
+      text('p', 'Đang xem với tư cách khán giả', 'spectator-banner__text'),
+      text('p', 'Bạn không có bài và không thể đánh trong ván này.', 'spectator-banner__hint'),
+    );
+    const bannerActions = element('div', 'spectator-banner__actions');
+    if (view.canTakeSeat) {
+      const seat = text('button', 'Vào ghế', 'btn btn--primary');
+      seat.type = 'button';
+      seat.dataset['testid'] = 'take-seat';
+      seat.disabled = !online;
+      seat.addEventListener('click', () => {
+        actions.takeSeat();
+      });
+      bannerActions.append(seat);
+    }
+    const leaveWatch = text('button', 'Thoát xem', 'btn btn--ghost');
+    leaveWatch.type = 'button';
+    leaveWatch.dataset['testid'] = 'leave-watch';
+    leaveWatch.disabled = !online;
+    leaveWatch.addEventListener('click', () => {
+      actions.leaveWatch();
+    });
+    bannerActions.append(leaveWatch);
+    banner.append(bannerActions);
+    screen.append(banner);
+  }
 
   const names = new Map<number, string>();
   for (const seat of view.seats) {
@@ -393,12 +544,38 @@ export function renderTable(
   }
 
   if (view.tableCards.length > 0) {
+    const table = element('div', 'board__table');
+    // Lớp mờ của bộ đánh ngay trước (chỉ 1 tầng, không nhận click, không đọc lại bằng screen reader).
+    if (view.previousTableCards.length > 0) {
+      const previous = element('div', 'board__previous');
+      previous.dataset['testid'] = 'previous-table';
+      previous.setAttribute(
+        'aria-label',
+        `Nước trước: ${view.previousTableLabel ?? `${view.previousTableComboSize} lá`}`,
+      );
+      const previousCards = element('div', 'board__previous-cards');
+      previousCards.setAttribute('aria-hidden', 'true');
+      for (const card of view.previousTableCards) {
+        previousCards.append(tableCard(card, `previous-card-${card.id}`));
+      }
+      previous.append(previousCards);
+      const previousLabel = text(
+        'p',
+        `Nước trước: ${view.previousTableLabel ?? `${view.previousTableComboSize} lá`}`,
+        'board__previous-label',
+      );
+      previousLabel.dataset['testid'] = 'previous-play-label';
+      previousLabel.setAttribute('aria-hidden', 'true');
+      previous.append(previousLabel);
+      table.append(previous);
+    }
     const cards = element('div', 'board__cards');
     for (const card of view.tableCards) cards.append(tableCard(card));
-    board.append(cards);
+    table.append(cards);
     if (view.lastPlayLabel !== null) {
-      board.append(text('p', view.lastPlayLabel, 'board__last'));
+      table.append(text('p', view.lastPlayLabel, 'board__last'));
     }
+    board.append(table);
   } else {
     board.append(text('p', 'Chưa có nước đánh.', 'board__placeholder'));
   }
@@ -412,9 +589,11 @@ export function renderTable(
 
   screen.append(board);
 
-  if ((view.youPlaced || view.youDenOut) && !view.isFinished) screen.append(placedNotice(view));
+  if ((view.youPlaced || view.youDenOut) && !view.isFinished && !view.isSpectator) {
+    screen.append(placedNotice(view));
+  }
 
-  if (state.chop !== null && !view.youPlaced && !view.youDenOut) {
+  if (state.chop !== null && !view.youPlaced && !view.youDenOut && !view.isSpectator) {
     screen.append(chopPanel(state.chop, actions));
   }
 
@@ -454,21 +633,39 @@ export function renderTable(
   const overlay = tourOverlay ?? resultOverlay(state, actions);
   if (overlay !== null) screen.append(overlay);
 
-  if (!view.isFinished && !view.youPlaced && !view.youDenOut && tourOverlay === null) {
+  if (
+    !view.isFinished &&
+    !view.youPlaced &&
+    !view.youDenOut &&
+    !view.isSpectator &&
+    tourOverlay === null
+  ) {
     const hand = element('section', 'hand');
     hand.dataset['testid'] = 'hand';
     hand.setAttribute('aria-label', 'Bài trên tay');
     const handHead = element('div', 'hand__head');
+    const handMeta = element('div', 'hand__meta');
+    handMeta.append(text('span', state.playHint, 'hand__hint'));
+    const resetOrder = text('button', 'Xếp lại', 'btn btn--tiny hand__reset');
+    resetOrder.type = 'button';
+    resetOrder.dataset['testid'] = 'sort-reset';
+    resetOrder.title = 'Sắp bài theo thứ tự mặc định';
+    resetOrder.setAttribute('aria-label', 'Sắp lại bài theo thứ tự mặc định');
+    resetOrder.disabled = !online;
+    resetOrder.addEventListener('click', () => {
+      actions.resetHandOrder();
+    });
+    handMeta.append(resetOrder);
     handHead.append(
       text('span', `Bài của bạn (${view.handCount} lá)`, 'hand__title'),
-      text('span', state.playHint, 'hand__hint'),
+      handMeta,
     );
     const cards = element('div', 'hand__cards');
-    const sorted = sortCards(state.hand);
-    for (const card of sorted) {
+    const ordered = orderedHand(state.hand, state.handOrder);
+    for (const card of ordered) {
       cards.append(handCard(card, state.selectedIds.has(card.id), actions));
     }
-    if (sorted.length === 0) cards.append(text('p', 'Không còn bài trên tay.', 'hint'));
+    if (ordered.length === 0) cards.append(text('p', 'Không còn bài trên tay.', 'hint'));
     hand.append(handHead, cards);
 
     const actionBar = element('div', 'action-bar');

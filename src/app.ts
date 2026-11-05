@@ -1,9 +1,16 @@
 import { rules } from './data';
 import { fetchAuthSession, logout, type AuthResult, type AuthSession } from './net/auth';
 import { GameClient, resolveWsUrl } from './net/client';
+import type { ClientSnapshot } from './net/client';
 import { renderTable, type ChopView, type TableActions } from './scenes/table';
 import { Ticker } from './ui/audio';
 import { formatServerError } from './ui/errors';
+import {
+  defaultHandOrder,
+  moveCardBy,
+  moveCardTo,
+  reconcileHandOrder,
+} from './ui/hand-order';
 import { renderLobby, type LobbyActions } from './ui/lobby';
 import { parseBreakdown } from './ui/result';
 import {
@@ -57,12 +64,18 @@ const RELOGIN_CODES: ReadonlySet<string> = new Set([
   'RECONNECT_WINDOW_EXPIRED',
 ]);
 
+/** Chờ danh sách phòng tối đa 3 giây rồi chuyển sang trạng thái lỗi + Thử lại. */
+const ROOM_LIST_TIMEOUT_MS = 3_000;
+
 export class App {
   readonly client: GameClient;
   private readonly root: HTMLElement;
   private readonly form: FormState = { nickname: '', code: '', tourCount: String(rules.tour.defaultCount) };
   private readonly ticker = new Ticker();
   private selected: Set<string> = new Set();
+  /** Thứ tự bài thủ công (card id), giữ trong phiên; reset khi đổi phòng/thoát phòng. */
+  private handOrder: string[] = [];
+  private handRoomCode: string | null = null;
   private chopSentFor: string | null = null;
   private stopTimer: (() => void) | null = null;
   private stopChopTimer: (() => void) | null = null;
@@ -76,6 +89,10 @@ export class App {
   private authChecking = false;
   /** Tab khác đã chiếm phiên (close 4001) — giữ thông báo cho tới khi người chơi chủ động làm gì. */
   private sessionReplaced = false;
+  /** Lỗi tải danh sách phòng ở sảnh; xoá khi server trả `roomList`. */
+  private roomListError: string | null = null;
+  private roomListTimer: ReturnType<typeof setTimeout> | null = null;
+  private roomListWaitStartedAt: number | null = null;
 
   private readonly lobbyActions: LobbyActions = {
     createRoom: (nickname, soVan) => {
@@ -95,6 +112,7 @@ export class App {
         return;
       }
       this.localError = null;
+      this.resetHandOrderState();
       this.client.createRoom(normalizeNickname(nickname), count);
     },
     joinRoom: (code, nickname) => {
@@ -109,6 +127,7 @@ export class App {
         return;
       }
       this.localError = null;
+      this.resetHandOrderState();
       this.client.joinRoom(normalizeRoomCode(code), normalizeNickname(nickname));
     },
     setReady: (ready) => {
@@ -130,6 +149,18 @@ export class App {
       }
       this.client.connect();
     },
+    listRooms: () => {
+      this.clearRoomListTimer();
+      this.roomListWaitStartedAt = Date.now();
+      this.roomListError = null;
+      if (this.client.listRooms()) {
+        this.startRoomListWait();
+      } else {
+        this.roomListWaitStartedAt = null;
+        this.roomListError = 'Chưa tải được danh sách phòng. Kiểm tra kết nối rồi thử lại.';
+      }
+      this.render();
+    },
     logout: () => {
       const hubLoginUrl = this.hubLoginUrl ?? this.auth?.hubLoginUrl ?? '';
       if (hubLoginUrl.length === 0) {
@@ -146,6 +177,7 @@ export class App {
       this.stopTourTimer = null;
       this.selected.clear();
       this.chopSentFor = null;
+      this.resetHandOrderState();
       clearSavedSession();
       this.client.close();
       void logout(hubLoginUrl, csrf);
@@ -168,6 +200,21 @@ export class App {
     toggleCard: (cardId) => {
       this.selected = toggleSelection(this.selected, cardId);
       this.render();
+    },
+    reorderCard: (cardId, toIndex) => {
+      this.handOrder = moveCardTo(this.ensureHandOrder(), cardId, toIndex);
+      this.render();
+      this.focusCard(cardId);
+    },
+    moveCardBy: (cardId, delta) => {
+      this.handOrder = moveCardBy(this.ensureHandOrder(), cardId, delta);
+      this.render();
+      this.focusCard(cardId);
+    },
+    resetHandOrder: () => {
+      this.handOrder = defaultHandOrder(this.client.getSnapshot().hand);
+      this.render();
+      this.root.querySelector<HTMLElement>('[data-testid="sort-reset"]')?.focus();
     },
     play: () => {
       const snapshot = this.client.getSnapshot();
@@ -223,11 +270,31 @@ export class App {
       clearSavedSession();
       this.selected.clear();
       this.chopSentFor = null;
+      this.resetHandOrderState();
       this.localError = null;
       this.lastErrorKey = null;
       this.client.leaveRoom();
     },
+    leaveWatch: () => {
+      this.leaveWatchSession();
+    },
+    takeSeat: () => {
+      const snapshot = this.client.getSnapshot();
+      if (snapshot.room === null) return;
+      this.selected.clear();
+      this.chopSentFor = null;
+      this.resetHandOrderState();
+      this.localError = null;
+      this.client.joinSeat(snapshot.room.code);
+    },
     leaveTour: () => {
+      const snapshot = this.client.getSnapshot();
+      const room = snapshot.room;
+      if (room !== null && (room.you.role === 'spectator' || room.you.seat === -1)) {
+        // Khán giả không có tour để rời: nút "Rời tour" trong overlay coi như thoát xem.
+        this.leaveWatchSession();
+        return;
+      }
       this.selected.clear();
       this.chopSentFor = null;
       this.client.leaveTour();
@@ -322,6 +389,78 @@ export class App {
     this.render();
   }
 
+  /** Thứ tự đã đồng bộ với bài hiện tại (lá mới append theo mặc định). */
+  private ensureHandOrder(): readonly string[] {
+    this.handOrder = reconcileHandOrder(this.handOrder, this.client.getSnapshot().hand);
+    return this.handOrder;
+  }
+
+  private focusCard(cardId: string): void {
+    this.root.querySelector<HTMLElement>(`[data-testid="card-${cardId}"]`)?.focus();
+  }
+
+  private resetHandOrderState(): void {
+    this.handOrder = [];
+    this.handRoomCode = null;
+  }
+
+  /** Thoát chế độ khán giả: xoá phiên local, giữ socket, xin lại danh sách phòng. */
+  private leaveWatchSession(): void {
+    this.selected.clear();
+    this.chopSentFor = null;
+    this.resetHandOrderState();
+    clearSavedSession();
+    this.localError = null;
+    this.lastErrorKey = null;
+    this.client.leaveWatch();
+  }
+
+  private clearRoomListTimer(): void {
+    if (this.roomListTimer !== null) {
+      clearTimeout(this.roomListTimer);
+      this.roomListTimer = null;
+    }
+  }
+
+  /** Một timer duy nhất cho mỗi lần chờ: render lại không tạo thêm timer. */
+  private startRoomListWait(): void {
+    if (this.roomListWaitStartedAt === null) this.roomListWaitStartedAt = Date.now();
+    if (this.roomListTimer !== null) return;
+    const elapsed = Date.now() - this.roomListWaitStartedAt;
+    this.roomListTimer = setTimeout(() => {
+      this.roomListTimer = null;
+      this.roomListWaitStartedAt = null;
+      const snapshot = this.client.getSnapshot();
+      if (snapshot.roomList !== null || snapshot.room !== null) return;
+      this.roomListError = 'Không tải được danh sách phòng. Kiểm tra kết nối rồi thử lại.';
+      this.render();
+    }, Math.max(0, ROOM_LIST_TIMEOUT_MS - elapsed));
+  }
+
+  /** Theo dõi danh sách phòng: bật/tắt timeout, không báo lỗi khi đang ở trong phòng. */
+  private watchRoomList(snapshot: ClientSnapshot): void {
+    if (snapshot.roomList !== null || snapshot.room !== null) {
+      this.clearRoomListTimer();
+      this.roomListWaitStartedAt = null;
+      this.roomListError = null;
+      return;
+    }
+    if (snapshot.status === 'closed') {
+      this.clearRoomListTimer();
+      this.roomListWaitStartedAt = null;
+      this.roomListError = 'Mất kết nối tới server. Kiểm tra mạng rồi thử lại.';
+      return;
+    }
+    if (snapshot.status !== 'open') {
+      // Đang nối/nối lại: giữ skeleton, chưa tính timeout.
+      this.clearRoomListTimer();
+      this.roomListWaitStartedAt = null;
+      return;
+    }
+    if (this.roomListError !== null) return;
+    this.startRoomListWait();
+  }
+
   private pruneSelection(hand: readonly { readonly id: string }[]): void {
     const handIds = new Set(hand.map((card) => card.id));
     for (const id of this.selected) {
@@ -341,6 +480,9 @@ export class App {
 
   private render(): void {
     const snapshot = this.client.getSnapshot();
+    this.watchRoomList(snapshot);
+    // Ở sảnh với socket mở thì phiên phòng cũ (kể cả khán giả) không còn giá trị.
+    if (snapshot.room === null && snapshot.status === 'open') clearSavedSession();
     if (snapshot.error === null) this.lastErrorKey = null;
     else {
       if (snapshot.error.code === 'SESSION_REPLACED') this.sessionReplaced = true;
@@ -352,6 +494,12 @@ export class App {
     }
 
     if (snapshot.room !== null) {
+      // Vào phòng khác (kể cả resume) thì bỏ thứ tự cũ; cùng phòng thì giữ qua lượt/ván.
+      if (this.handRoomCode !== snapshot.room.code) {
+        this.handRoomCode = snapshot.room.code;
+        this.handOrder = [];
+      }
+      this.handOrder = reconcileHandOrder(this.handOrder, snapshot.hand);
       saveSavedSession({
         roomCode: snapshot.room.code,
         token: snapshot.room.you.token,
@@ -412,6 +560,7 @@ export class App {
           reconnectAttempt: snapshot.reconnectAttempt,
           selectedIds: this.selected,
           hand: snapshot.hand,
+          handOrder: this.handOrder,
           playable: selection.playable,
           playHint: selection.hint,
           canPass: canPassTurn(state, snapshot.room.you.seat),
@@ -498,6 +647,8 @@ export class App {
         authNotice: this.authNotice,
         reloginUrl: showRelogin ? this.hubLoginUrl : null,
         reloginLabel: this.sessionReplaced ? 'Mở lại ở tab này' : 'Đăng nhập lại',
+        roomList: snapshot.roomList,
+        roomListError: this.roomListError,
       },
       this.lobbyActions,
     );

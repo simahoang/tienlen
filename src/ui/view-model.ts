@@ -6,13 +6,29 @@ import type {
   RoomPlayerView,
   RoomView,
   StatePlayerView,
+  TourView,
 } from '../net/protocol';
 import { tourPhaseLabel } from './tour';
 
 export type Screen = 'lobby' | 'table';
 
+/** Khán giả không có ghế (`seat === -1`) hoặc server khai báo `role`. */
+export function isSpectatorRoom(room: RoomView | null): boolean {
+  if (room === null) return false;
+  return room.you.role === 'spectator' || room.you.seat === -1;
+}
+
 export function resolveScreen(room: RoomView | null): Screen {
-  return room !== null && room.phase !== 'lobby' ? 'table' : 'lobby';
+  if (room === null) return 'lobby';
+  // Khán giả vào xem phòng còn ở lobby (đầy ghế) vẫn phải thấy bàn bài.
+  if (isSpectatorRoom(room)) return 'table';
+  return room.phase !== 'lobby' ? 'table' : 'lobby';
+}
+
+/** Tour đang chạy thì không nhận người mới vào ghế (doc-5 §4.1). */
+function isTourActiveView(tour: TourView | undefined): boolean {
+  if (tour === undefined) return false;
+  return tour.phase === 'running' || tour.phase === 'betweenRounds' || tour.phase === 'paused';
 }
 
 export const NICKNAME_MAX_LENGTH = 20;
@@ -125,6 +141,14 @@ export interface TableViewModel {
   readonly handCount: number;
   readonly tableCards: readonly CardView[];
   readonly lastPlayLabel: string | null;
+  /** Bộ đánh ngay trước bộ đang dẫn trong cùng vòng (doc-5 §6); rỗng khi không có. */
+  readonly previousTableCards: readonly CardView[];
+  /** Ghế đánh bộ trước; null khi không có bộ trước. */
+  readonly previousTableSeat: number | null;
+  /** `An đánh 1 lá` cho bộ trước; null khi không có. */
+  readonly previousTableLabel: string | null;
+  /** Số lá của bộ trước; 0 khi không có. */
+  readonly previousTableComboSize: number;
   /** Hạng đã chốt, có thể rỗng/thiếu ghế khi ván còn chơi tiếp. */
   readonly ranking: readonly RankingView[] | null;
   readonly scores: readonly number[] | null;
@@ -144,6 +168,12 @@ export interface TableViewModel {
   /** true = lượt đầu ván này đánh tự do (ván ≥ 2). */
   readonly firstMoveFree: boolean;
   readonly tourLabel: string | null;
+  /** Bạn đang xem với tư cách khán giả (không có ghế, không có bài). */
+  readonly isSpectator: boolean;
+  /** Số khán giả hiện tại của phòng; 0 khi server cũ không gửi. */
+  readonly spectatorCount: number;
+  /** Khán giả có thể xin vào ghế trống (lobby, còn ghế, tour không chạy). */
+  readonly canTakeSeat: boolean;
 }
 
 const PHASE_LABELS: Readonly<Record<RoomPhase, string>> = {
@@ -226,6 +256,16 @@ export function buildTableView(
     ? `${lastPlayer ? lastPlayer.nickname : `Ghế ${table.seat + 1}`} đánh ${table.comboSize} lá`
     : null;
 
+  // Server chỉ gửi previousTable trong cùng vòng; client cũ hoặc thiếu → không vẽ lớp mờ.
+  const previous = state?.previousTable ?? null;
+  const previousCards = previous ? previous.cards : [];
+  const previousPlayer =
+    previous === null ? undefined : state?.players.find((p) => p.seat === previous.seat);
+  const previousTableLabel =
+    previous === null
+      ? null
+      : `${previousPlayer ? previousPlayer.nickname : `Ghế ${previous.seat + 1}`} đánh ${previous.comboSize} lá`;
+
   const firstSeat = state?.firstSeat ?? null;
   const firstPlayer =
     firstSeat === null ? undefined : state?.players.find((p) => p.seat === firstSeat);
@@ -236,6 +276,13 @@ export function buildTableView(
         room.players.find((p) => p.seat === firstSeat)?.nickname ??
         `Ghế ${firstSeat + 1}`;
   const roundIndex = state?.roundIndex ?? room.tour?.roundIndex ?? null;
+  const isSpectator = isSpectatorRoom(room);
+  const spectatorCount = room.spectatorCount ?? 0;
+  const canTakeSeat =
+    isSpectator &&
+    room.phase === 'lobby' &&
+    !isTourActiveView(room.tour) &&
+    room.players.length < room.maxSeats;
 
   return {
     roomCode: room.code,
@@ -248,6 +295,10 @@ export function buildTableView(
     handCount: hand.length,
     tableCards: table ? table.cards : [],
     lastPlayLabel,
+    previousTableCards: previousCards,
+    previousTableSeat: previous === null ? null : previous.seat,
+    previousTableLabel,
+    previousTableComboSize: previous === null ? 0 : previous.comboSize,
     ranking: state?.ranking ?? null,
     scores: state?.scores ?? null,
     isFinished: (state?.phase ?? room.phase) === 'finished',
@@ -261,5 +312,8 @@ export function buildTableView(
     firstPlayerNickname,
     firstMoveFree: state?.firstMoveFree === true,
     tourLabel: tourPhaseLabel(room.tour),
+    isSpectator,
+    spectatorCount,
+    canTakeSeat,
   };
 }

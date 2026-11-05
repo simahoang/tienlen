@@ -19,6 +19,7 @@ import type { AuthedSocket, Principal } from './auth/principal';
 import type { GameStore } from './db';
 import {
   MAX_SEATS,
+  MAX_SPECTATORS,
   MIN_SEATS,
   NICKNAME_MAX,
   ROOM_CODE_LENGTH,
@@ -31,6 +32,7 @@ import {
   type PublicGameState,
   type RankingView,
   type RoomPhase,
+  type RoomSummaryView,
   type RoomView,
   type ServerMessage,
   type TableView,
@@ -46,6 +48,18 @@ import {
 
 const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const DEFAULT_MAX_ROOMS = 500;
+/** Message mà khán giả không được gửi (doc-5 §4.2). */
+const SPECTATOR_BLOCKED: ReadonlySet<ClientMessage['t']> = new Set([
+  'ready',
+  'start',
+  'play',
+  'pass',
+  'surrender',
+  'chop',
+  'leaveTour',
+  'endTour',
+  'newTour',
+]);
 /** Mặc định 10 phút: giữ phòng finished đủ lâu để client xem kết quả rồi mới dọn. */
 const DEFAULT_ROOM_TTL_MS = 600_000;
 /** Mã đóng WS khi một tab khác của cùng account chiếm ghế. */
@@ -121,9 +135,17 @@ interface TourScore {
   lastPlace: Place | null;
 }
 
-interface Binding {
-  readonly room: Room;
-  readonly player: RoomPlayer;
+type Binding =
+  | { readonly room: Room; readonly role: 'player'; readonly player: RoomPlayer }
+  | { readonly room: Room; readonly role: 'spectator'; readonly spectator: RoomSpectator };
+
+/** Khán giả: không ghế, không bài, token reconnect riêng (doc-5 §4). */
+interface RoomSpectator {
+  readonly account: string;
+  readonly nickname: string;
+  readonly token: string;
+  socket: WebSocket | null;
+  connected: boolean;
 }
 
 export class Room {
@@ -139,6 +161,7 @@ export class Room {
   /** Thời gian còn lại của lượt khi timer bị tạm dừng vì chopWindow. */
   turnRemainingMs: number | null = null;
   readonly players: RoomPlayer[] = [];
+  readonly spectators: RoomSpectator[] = [];
   readonly rateHits: number[] = [];
   turnTimer: NodeJS.Timeout | null = null;
   windowTimer: NodeJS.Timeout | null = null;
@@ -207,10 +230,14 @@ export class RoomManager {
   private readonly rooms = new Map<string, Room>();
   private readonly bindings = new Map<WebSocket, Binding>();
   private readonly accountSockets = new Map<string, WebSocket>();
+  /** Mọi socket đã kết nối (kể cả chưa vào phòng) để push roomList cho sảnh. */
+  private readonly sockets = new Set<WebSocket>();
+  private roomListTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly config: RoomManagerConfig) {}
 
   handleConnection(socket: WebSocket): void {
+    this.sockets.add(socket);
     socket.on('message', (data: unknown) => {
       this.handleText(socket, typeof data === 'string' ? data : String(data));
     });
@@ -229,12 +256,26 @@ export class RoomManager {
   }
 
   private dispatch(socket: WebSocket, message: ClientMessage): void {
+    const binding = this.bindings.get(socket);
+    if (binding?.role === 'spectator' && SPECTATOR_BLOCKED.has(message.t)) {
+      this.sendError(socket, 'FORBIDDEN_ROLE', 'khán giả không thể thực hiện hành động này');
+      return;
+    }
     switch (message.t) {
       case 'createRoom':
         this.createRoom(socket, message.soVan);
         return;
       case 'joinRoom':
         this.joinRoom(socket, message.code);
+        return;
+      case 'joinSeat':
+        this.joinSeat(socket, message.code);
+        return;
+      case 'leaveWatch':
+        this.leaveWatch(socket);
+        return;
+      case 'listRooms':
+        this.sendRoomList(socket);
         return;
       case 'ready':
         this.setReady(socket, message.ready);
@@ -265,6 +306,17 @@ export class RoomManager {
     }
   }
 
+  private bindingOf(socket: WebSocket): Binding | null {
+    return this.bindings.get(socket) ?? null;
+  }
+
+  private playerBindingOf(socket: WebSocket): { room: Room; player: RoomPlayer } | null {
+    const binding = this.bindingOf(socket);
+    return binding && binding.role === 'player'
+      ? { room: binding.room, player: binding.player }
+      : null;
+  }
+
   /** Principal do server gắn lúc upgrade; null nghĩa là socket chưa xác thực. */
   private principalOf(socket: WebSocket): Principal | null {
     return (socket as AuthedSocket).principal ?? null;
@@ -283,6 +335,14 @@ export class RoomManager {
     }
     const oldBinding = this.bindings.get(current);
     if (!oldBinding) {
+      this.accountSockets.set(account, socket);
+      return true;
+    }
+    if (oldBinding.role === 'spectator') {
+      // Đang xem phòng khác: nhường ngay, không ảnh hưởng ghế/ván.
+      this.removeSpectator(oldBinding.room, oldBinding.spectator);
+      this.bindings.delete(current);
+      current.close(CLOSE_REPLACED, 'REPLACED');
       this.accountSockets.set(account, socket);
       return true;
     }
@@ -306,6 +366,20 @@ export class RoomManager {
     if (room.players.length === 0) {
       this.clearAllTimers(room);
       this.rooms.delete(room.code);
+      // Khán giả còn lại về sảnh, giữ socket để nhận roomList mới.
+      for (const spectator of [...room.spectators]) {
+        const socket = spectator.socket;
+        spectator.socket = null;
+        spectator.connected = false;
+        if (!socket) continue;
+        this.bindings.delete(socket);
+        if (this.accountSockets.get(spectator.account) === socket) {
+          this.accountSockets.delete(spectator.account);
+        }
+        this.sendRoomList(socket);
+      }
+      room.spectators.length = 0;
+      this.scheduleRoomList();
       return;
     }
     room.players.sort((a, b) => a.seat - b.seat);
@@ -374,8 +448,9 @@ export class RoomManager {
     room.players.push(player);
     room.hostSeat = 0;
     this.rooms.set(code, room);
-    this.bindings.set(socket, { room, player });
+    this.bindings.set(socket, { room, role: 'player', player });
     this.sendRoom(room, player);
+    this.scheduleRoomList();
   }
 
   /** Tour đang trong vòng chơi (chưa tổng kết) — khoá ghế, không nhận người mới. */
@@ -405,27 +480,31 @@ export class RoomManager {
       return;
     }
     const account = principal.username;
-    const tourActive = this.isTourActive(room);
-    if (tourActive && !rules.tour.allowMidJoin) {
-      // Quyết định 2026-11-05: tour đã bắt đầu thì không nhận người mới vào ghế trống.
-      const seated = room.players.some((player) => !player.left && player.account === account);
-      if (seated) {
-        // Không tạo ghế thứ hai cho cùng account; người có ghế phải reconnect bằng token.
-        this.sendError(
-          socket,
-          'ALREADY_IN_GAME',
-          'tài khoản đã có ghế trong tour này, hãy reconnect bằng token',
-        );
-        return;
-      }
-      this.sendError(socket, 'TOUR_IN_PROGRESS', 'Tour đang diễn ra, không thể vào giữa tour');
+    if (room.players.some((player) => !player.left && player.account === account)) {
+      // Không tạo ghế thứ hai cho cùng account; người có ghế phải reconnect bằng token.
+      this.sendError(
+        socket,
+        'ALREADY_IN_GAME',
+        'tài khoản đã có ghế trong phòng này, hãy reconnect bằng token',
+      );
       return;
     }
-    const tourJoinable = tourActive && rules.tour.allowMidJoin && room.phase !== 'playing';
+    if (room.spectators.some((entry) => entry.account === account)) {
+      this.sendError(
+        socket,
+        'ALREADY_IN_GAME',
+        'tài khoản đang xem phòng này, hãy reconnect bằng token',
+      );
+      return;
+    }
+    const tourActive = this.isTourActive(room);
     // Tour đã tổng kết: phòng coi như sảnh chờ tour mới nên vẫn nhận người vào ghế trống.
     const tourFinished = room.tourId !== null && room.tourPhase === 'finished';
-    if (room.phase !== 'lobby' && !tourJoinable && !tourFinished) {
-      this.sendError(socket, 'GAME_IN_PROGRESS', 'ván đã bắt đầu, không thể vào giữa ván');
+    const seatsOpen =
+      room.phase === 'lobby' || tourFinished || (tourActive && rules.tour.allowMidJoin);
+    if (!seatsOpen || this.firstFreeSeat(room) === null) {
+      // Hết ghế / đang chơi / tour đang chạy: vào xem, không tạo ghế (doc-5 §4.1).
+      this.addSpectator(socket, room, principal);
       return;
     }
     if (!this.claimAccount(account, socket)) {
@@ -438,7 +517,8 @@ export class RoomManager {
     }
     const seat = this.firstFreeSeat(room);
     if (seat === null) {
-      this.sendError(socket, 'ROOM_FULL', 'phòng đã đủ ghế');
+      // claimAccount có thể vừa giải phóng/đổi ghế: kiểm tra lại rồi lùi về khán giả.
+      this.addSpectator(socket, room, principal);
       return;
     }
     const nickname = nicknameOf(principal);
@@ -455,7 +535,7 @@ export class RoomManager {
       socket,
     };
     room.players.push(player);
-    this.bindings.set(socket, { room, player });
+    this.bindings.set(socket, { room, role: 'player', player });
     if (room.tourId !== null && room.roundIndex > 0) {
       // Vào sau khi tour đã chơi ít nhất 1 ván (chỉ còn cửa sổ sau tổng kết): điểm từ 0,
       // cờ vào giữa tour, không kế thừa hạng ván trước.
@@ -477,6 +557,123 @@ export class RoomManager {
     this.broadcastRoom(room);
   }
 
+  /** Vào xem: không ghế, không bài, token riêng để reconnect (tối đa MAX_SPECTATORS). */
+  private addSpectator(socket: WebSocket, room: Room, principal: Principal): void {
+    // Dọn slot của khán giả đã đóng socket để người mới không bị chặn oan.
+    for (const stale of [...room.spectators]) {
+      if (stale.connected) continue;
+      this.removeSpectator(room, stale);
+    }
+    if (room.spectators.length >= MAX_SPECTATORS) {
+      this.sendError(socket, 'ROOM_SPECTATOR_FULL', 'phòng đã đủ khán giả');
+      return;
+    }
+    const account = principal.username;
+    if (!this.claimAccount(account, socket)) {
+      this.sendError(
+        socket,
+        'ALREADY_IN_GAME',
+        'tài khoản đang trong ván khác, hãy quay lại tab cũ hoặc chờ ván kết thúc',
+      );
+      return;
+    }
+    const spectator: RoomSpectator = {
+      account,
+      nickname: nicknameOf(principal),
+      token: randomUUID(),
+      socket,
+      connected: true,
+    };
+    room.spectators.push(spectator);
+    this.bindings.set(socket, { room, role: 'spectator', spectator });
+    this.cancelCleanup(room);
+    this.sendRoom(room, spectator);
+    this.broadcastRoom(room);
+    if (room.game) this.sendState(room, spectator, { includeLog: true });
+    this.sendTourSnapshot(room, spectator);
+  }
+
+  private removeSpectator(room: Room, spectator: RoomSpectator): void {
+    const index = room.spectators.indexOf(spectator);
+    if (index >= 0) room.spectators.splice(index, 1);
+    const socket = spectator.socket;
+    spectator.socket = null;
+    spectator.connected = false;
+    if (!socket) return;
+    this.bindings.delete(socket);
+    if (this.accountSockets.get(spectator.account) === socket) {
+      this.accountSockets.delete(spectator.account);
+    }
+  }
+
+  /** Khán giả xin vào ghế trống khi phòng còn mở (doc-5 §4.1, TS-09). */
+  private joinSeat(socket: WebSocket, code: string): void {
+    const binding = this.bindingOf(socket);
+    if (!binding) {
+      this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
+      return;
+    }
+    if (binding.role !== 'spectator') {
+      this.sendError(socket, 'FORBIDDEN_ROLE', 'chỉ khán giả mới dùng joinSeat');
+      return;
+    }
+    const room = binding.room;
+    if (room.code !== code) {
+      this.sendError(socket, 'ROOM_MISMATCH', 'không phải phòng đang xem');
+      return;
+    }
+    if (room.phase !== 'lobby' || this.isTourActive(room)) {
+      this.sendError(socket, 'ROOM_NOT_LOBBY', 'phòng không còn chỗ cho người mới');
+      return;
+    }
+    if (room.players.some((player) => !player.left && player.account === binding.spectator.account)) {
+      this.sendError(socket, 'ALREADY_IN_GAME', 'tài khoản đã có ghế trong phòng');
+      return;
+    }
+    const seat = this.firstFreeSeat(room);
+    if (seat === null) {
+      this.sendError(socket, 'ROOM_FULL', 'phòng đã đủ ghế');
+      return;
+    }
+    const spectator = binding.spectator;
+    const nickname = spectator.nickname;
+    const player: RoomPlayer = {
+      seat,
+      account: spectator.account,
+      nickname,
+      token: randomUUID(),
+      userId: this.config.store?.createUser(nickname) ?? null,
+      ready: false,
+      connected: true,
+      surrendered: false,
+      left: false,
+      socket,
+    };
+    this.removeSpectator(room, spectator);
+    room.players.push(player);
+    this.bindings.set(socket, { room, role: 'player', player });
+    this.sendRoom(room, player);
+    this.broadcastRoom(room);
+    if (room.game) this.sendState(room, player);
+  }
+
+  /** Khán giả tự rời phòng, giữ socket để quay lại sảnh. */
+  private leaveWatch(socket: WebSocket): void {
+    const binding = this.bindingOf(socket);
+    if (!binding) {
+      this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
+      return;
+    }
+    if (binding.role !== 'spectator') {
+      this.sendError(socket, 'FORBIDDEN_ROLE', 'chỉ khán giả mới dùng leaveWatch');
+      return;
+    }
+    this.removeSpectator(binding.room, binding.spectator);
+    this.broadcastRoom(binding.room);
+    this.maybeScheduleCleanup(binding.room);
+    this.sendRoomList(socket);
+  }
+
   private firstFreeSeat(room: Room): number | null {
     for (let seat = 0; seat < MAX_SEATS; seat += 1) {
       if (!room.players.some((player) => !player.left && player.seat === seat)) return seat;
@@ -485,7 +682,7 @@ export class RoomManager {
   }
 
   private setReady(socket: WebSocket, ready: boolean): void {
-    const binding = this.bindings.get(socket);
+    const binding = this.playerBindingOf(socket);
     if (!binding) {
       this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
       return;
@@ -507,7 +704,7 @@ export class RoomManager {
   }
 
   private startGame(socket: WebSocket): void {
-    const binding = this.bindings.get(socket);
+    const binding = this.playerBindingOf(socket);
     if (!binding) {
       this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
       return;
@@ -654,7 +851,7 @@ export class RoomManager {
     socket: WebSocket,
     message: Extract<ClientMessage, { t: 'play' | 'pass' | 'surrender' | 'chop' }>,
   ): void {
-    const binding = this.bindings.get(socket);
+    const binding = this.playerBindingOf(socket);
     if (!binding) {
       this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
       return;
@@ -1112,17 +1309,20 @@ export class RoomManager {
     for (const player of room.players) {
       if (player.socket) this.send(player.socket, message);
     }
+    for (const spectator of room.spectators) {
+      if (spectator.socket) this.send(spectator.socket, message);
+    }
   }
 
   /** Reconnect vào phòng đang ở giữa tour: dựng lại overlay đúng trạng thái. */
-  private sendTourSnapshot(room: Room, player: RoomPlayer): void {
-    if (!player.socket || room.tourId === null) return;
+  private sendTourSnapshot(room: Room, viewer: RoomPlayer | RoomSpectator): void {
+    if (!viewer.socket || room.tourId === null) return;
     if (room.tourPhase === 'betweenRounds' || room.tourPhase === 'paused') {
-      if (room.roundIndex > 0) this.send(player.socket, this.buildTourResult(room));
-      if (room.tourPhase === 'paused') this.send(player.socket, this.buildTourPaused(room));
+      if (room.roundIndex > 0) this.send(viewer.socket, this.buildTourResult(room));
+      if (room.tourPhase === 'paused') this.send(viewer.socket, this.buildTourPaused(room));
       return;
     }
-    if (room.tourPhase === 'finished') this.send(player.socket, this.buildTourEnd(room));
+    if (room.tourPhase === 'finished') this.send(viewer.socket, this.buildTourEnd(room));
   }
 
   private buildTourPaused(room: Room): ServerMessage {
@@ -1204,6 +1404,9 @@ export class RoomManager {
     for (const player of room.players) {
       if (player.socket) this.send(player.socket, message);
     }
+    for (const spectator of room.spectators) {
+      if (spectator.socket) this.send(spectator.socket, message);
+    }
     this.broadcastRoom(room);
     this.maybeScheduleCleanup(room);
   }
@@ -1261,6 +1464,9 @@ export class RoomManager {
     const message: ServerMessage = { t: 'tourEnd', summary, serverNow: Date.now() };
     for (const player of room.players) {
       if (player.socket) this.send(player.socket, message);
+    }
+    for (const spectator of room.spectators) {
+      if (spectator.socket) this.send(spectator.socket, message);
     }
     this.broadcastRoom(room);
     this.maybeScheduleCleanup(room);
@@ -1329,7 +1535,7 @@ export class RoomManager {
   }
 
   private leaveTour(socket: WebSocket): void {
-    const binding = this.bindings.get(socket);
+    const binding = this.playerBindingOf(socket);
     if (!binding) {
       this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
       return;
@@ -1345,7 +1551,7 @@ export class RoomManager {
   }
 
   private endTour(socket: WebSocket): void {
-    const binding = this.bindings.get(socket);
+    const binding = this.playerBindingOf(socket);
     if (!binding) {
       this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
       return;
@@ -1372,7 +1578,7 @@ export class RoomManager {
 
   /** doc-4 §3.1: TONG_KET_TOUR → tour mới cùng ghế, điểm từ 0, `tour_id` mới. */
   private newTour(socket: WebSocket, soVan?: number): void {
-    const binding = this.bindings.get(socket);
+    const binding = this.playerBindingOf(socket);
     if (!binding) {
       this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
       return;
@@ -1443,11 +1649,19 @@ export class RoomManager {
       this.sendError(socket, 'ALREADY_IN_ROOM', 'socket đã ở trong một phòng');
       return;
     }
-    let found: Binding | null = null;
+    let found:
+      | { readonly room: Room; readonly player: RoomPlayer }
+      | { readonly room: Room; readonly spectator: RoomSpectator }
+      | null = null;
     for (const room of this.rooms.values()) {
       const player = room.players.find((entry) => entry.token === token);
       if (player) {
         found = { room, player };
+        break;
+      }
+      const spectator = room.spectators.find((entry) => entry.token === token);
+      if (spectator) {
+        found = { room, spectator };
         break;
       }
     }
@@ -1455,55 +1669,105 @@ export class RoomManager {
       this.sendError(socket, 'INVALID_TOKEN', 'token không khớp phòng/ván nào');
       return;
     }
-    const { room, player } = found;
     const account = principal.username;
-    if (player.account !== account) {
-      // Token là bí mật của người chơi khác: không chiếm ghế, không đóng socket của họ.
+    const room = found.room;
+    const ownAccount = 'player' in found ? found.player.account : found.spectator.account;
+    if (ownAccount !== account) {
+      // Token là bí mật của người khác: không chiếm chỗ, không đóng socket của họ.
       this.sendError(socket, 'INVALID_TOKEN', 'token không thuộc tài khoản này');
       return;
     }
-    if (player.surrendered) {
-      this.sendError(socket, 'RECONNECT_EXPIRED', 'đã quá hạn reconnect, ghế đã xử thua');
+    if ('player' in found) {
+      const player = found.player;
+      if (player.surrendered) {
+        this.sendError(socket, 'RECONNECT_EXPIRED', 'đã quá hạn reconnect, ghế đã xử thua');
+        return;
+      }
+      const previous = player.socket;
+      if (previous && previous !== socket) {
+        this.bindings.delete(previous);
+        previous.close(CLOSE_REPLACED, 'REPLACED');
+      }
+      // Các socket khác của cùng account (tab khác/phòng khác) cũng phải nhường.
+      for (const [other, binding] of this.bindings) {
+        if (other === socket) continue;
+        const otherAccount =
+          binding.role === 'player' ? binding.player.account : binding.spectator.account;
+        if (otherAccount !== account) continue;
+        const same = binding.role === 'player' && binding.player === player;
+        if (same) this.bindings.delete(other);
+        other.close(CLOSE_REPLACED, 'REPLACED');
+      }
+      player.socket = socket;
+      player.connected = true;
+      this.bindings.set(socket, { room, role: 'player', player });
+      this.accountSockets.set(account, socket);
+      this.cancelCleanup(room);
+      this.clearGrace(room, player.seat);
+      this.clearExpiry(room, player.seat);
+      this.sendRoom(room, player);
+      this.broadcastRoom(room);
+      if (room.game) {
+        // §3.2: reconnect nhận full state + action log công khai; người khác nhận state thường.
+        this.sendState(room, player, { includeLog: true });
+        for (const other of room.players) {
+          if (other !== player) this.sendState(room, other);
+        }
+        for (const watcher of room.spectators) this.sendState(room, watcher);
+      }
+      this.sendTourSnapshot(room, player);
       return;
     }
-    const previous = player.socket;
+
+    const spectator = found.spectator;
+    const previous = spectator.socket;
     if (previous && previous !== socket) {
       this.bindings.delete(previous);
       previous.close(CLOSE_REPLACED, 'REPLACED');
     }
-    // Các socket khác của cùng account (tab khác/phòng khác) cũng phải nhường.
     for (const [other, binding] of this.bindings) {
       if (other === socket) continue;
-      if (binding.player.account !== account) continue;
-      if (binding.player === player) {
+      const otherAccount =
+        binding.role === 'player' ? binding.player.account : binding.spectator.account;
+      if (otherAccount !== account) continue;
+      if (binding.role === 'spectator' && binding.spectator === spectator) {
         this.bindings.delete(other);
       }
       other.close(CLOSE_REPLACED, 'REPLACED');
     }
-    player.socket = socket;
-    player.connected = true;
-    this.bindings.set(socket, { room, player });
+    spectator.socket = socket;
+    spectator.connected = true;
+    this.bindings.set(socket, { room, role: 'spectator', spectator });
     this.accountSockets.set(account, socket);
     this.cancelCleanup(room);
-    this.clearGrace(room, player.seat);
-    this.clearExpiry(room, player.seat);
-    this.sendRoom(room, player);
+    this.sendRoom(room, spectator);
     this.broadcastRoom(room);
-    if (room.game) {
-      // §3.2: reconnect nhận full state + action log công khai; người khác nhận state thường.
-      this.sendState(room, player, { includeLog: true });
-      for (const other of room.players) {
-        if (other !== player) this.sendState(room, other);
-      }
-    }
-    this.sendTourSnapshot(room, player);
+    if (room.game) this.sendState(room, spectator, { includeLog: true });
+    this.sendTourSnapshot(room, spectator);
   }
 
   private handleClose(socket: WebSocket): void {
+    this.sockets.delete(socket);
     const binding = this.bindings.get(socket);
     if (!binding) return;
     this.bindings.delete(socket);
-    const { room, player } = binding;
+    const room = binding.room;
+
+    if (binding.role === 'spectator') {
+      // Đóng socket: gỡ khỏi phòng (không ảnh hưởng ghế/tour) nhưng giữ token để
+      // reconnect xem tiếp; slot khán giả được dọn khi hết hạn hoặc có người mới.
+      const spectator = binding.spectator;
+      if (this.accountSockets.get(spectator.account) === socket) {
+        this.accountSockets.delete(spectator.account);
+      }
+      spectator.socket = null;
+      spectator.connected = false;
+      this.broadcastRoom(room);
+      this.maybeScheduleCleanup(room);
+      return;
+    }
+
+    const player = binding.player;
     if (this.accountSockets.get(player.account) === socket) {
       this.accountSockets.delete(player.account);
     }
@@ -1650,11 +1914,13 @@ export class RoomManager {
     if (room.cleanupTimer) return;
     if (room.phase !== 'finished') return;
     if (room.players.some((player) => player.connected)) return;
+    if (room.spectators.some((spectator) => spectator.connected)) return;
     const ttl = this.config.roomTtlMs ?? DEFAULT_ROOM_TTL_MS;
     room.cleanupTimer = setTimeout(() => {
       room.cleanupTimer = null;
       if (this.rooms.get(room.code) !== room) return;
       if (room.players.some((player) => player.connected)) return;
+      if (room.spectators.some((spectator) => spectator.connected)) return;
       this.deleteRoom(room);
     }, ttl);
   }
@@ -1683,33 +1949,46 @@ export class RoomManager {
     for (const [socket, binding] of this.bindings) {
       if (binding.room !== room) continue;
       this.bindings.delete(socket);
-      if (this.accountSockets.get(binding.player.account) === socket) {
-        this.accountSockets.delete(binding.player.account);
+      const account = binding.role === 'player' ? binding.player.account : binding.spectator.account;
+      if (this.accountSockets.get(account) === socket) {
+        this.accountSockets.delete(account);
       }
     }
+    room.spectators.length = 0;
+    this.scheduleRoomList();
   }
 
   /** Dừng mọi timer khi đóng server (test không bị treo). */
   dispose(): void {
+    if (this.roomListTimer) {
+      clearTimeout(this.roomListTimer);
+      this.roomListTimer = null;
+    }
     for (const room of this.rooms.values()) this.clearAllTimers(room);
     this.rooms.clear();
     this.bindings.clear();
     this.accountSockets.clear();
+    this.sockets.clear();
   }
 
-  private sendRoom(room: Room, player: RoomPlayer): void {
-    if (!player.socket) return;
-    this.send(player.socket, { t: 'room', room: this.publicRoom(room, player) });
+  private sendRoom(room: Room, viewer: RoomPlayer | RoomSpectator): void {
+    if (!viewer.socket) return;
+    this.send(viewer.socket, { t: 'room', room: this.publicRoom(room, viewer) });
   }
 
   private broadcastRoom(room: Room): void {
     for (const player of room.players) {
       if (player.socket) this.sendRoom(room, player);
     }
+    for (const spectator of room.spectators) {
+      if (spectator.socket) this.sendRoom(room, spectator);
+    }
+    this.scheduleRoomList();
   }
 
   private broadcastState(room: Room): void {
     for (const player of room.players) this.sendState(room, player);
+    for (const spectator of room.spectators) this.sendState(room, spectator);
   }
 
   private broadcastDenBai(room: Room, event: DenBaiView): void {
@@ -1717,16 +1996,75 @@ export class RoomManager {
     for (const player of room.players) {
       if (player.socket) this.send(player.socket, message);
     }
+    for (const spectator of room.spectators) {
+      if (spectator.socket) this.send(spectator.socket, message);
+    }
   }
 
-  private sendState(room: Room, player: RoomPlayer, options: { includeLog?: boolean } = {}): void {
-    if (!player.socket || player.socket.readyState !== 1) return;
-    this.send(player.socket, {
+  private sendState(
+    room: Room,
+    viewer: RoomPlayer | RoomSpectator,
+    options: { includeLog?: boolean } = {},
+  ): void {
+    if (!viewer.socket || viewer.socket.readyState !== 1) return;
+    const isPlayer = 'seat' in viewer;
+    this.send(viewer.socket, {
       t: 'state',
-      you: { seat: player.seat, hand: this.handOf(room, player) },
+      you: { seat: isPlayer ? viewer.seat : -1, hand: isPlayer ? this.handOf(room, viewer) : [] },
       state: this.publicState(room),
       ...(options.includeLog ? { actionLog: this.publicActionLog(room) } : {}),
     });
+  }
+
+  private roomSummaries(): readonly RoomSummaryView[] {
+    return [...this.rooms.values()]
+      .map((room) => {
+        const host = room.players.find(
+          (player) => !player.left && player.seat === room.hostSeat,
+        );
+        return {
+          code: room.code,
+          hostNickname: host?.nickname ?? '',
+          playerCount: room.players.filter((player) => !player.left).length,
+          maxSeats: MAX_SEATS,
+          phase: room.phase,
+          spectatorCount: this.spectatorCount(room),
+          roundIndex: room.tourId !== null ? room.roundIndex : null,
+          soVan: room.tourId !== null ? room.soVan : null,
+          canJoin:
+            room.phase === 'lobby' &&
+            !this.isTourActive(room) &&
+            this.firstFreeSeat(room) !== null,
+        };
+      })
+      .sort((a, b) => a.code.localeCompare(b.code));
+  }
+
+  /** Gom broadcast danh sách phòng 50ms/lần để không spam khi nhiều thay đổi liên tiếp. */
+  private scheduleRoomList(): void {
+    if (this.roomListTimer) return;
+    this.roomListTimer = setTimeout(() => {
+      this.roomListTimer = null;
+      this.pushRoomList();
+    }, 50);
+    this.roomListTimer.unref?.();
+  }
+
+  /** Chỉ socket đang ở sảnh (chưa có binding) nhận push; socket trong phòng không cần. */
+  private pushRoomList(): void {
+    const message: ServerMessage = {
+      t: 'roomList',
+      rooms: this.roomSummaries(),
+      serverNow: Date.now(),
+    };
+    for (const socket of this.sockets) {
+      if (this.bindings.has(socket)) continue;
+      this.send(socket, message);
+    }
+  }
+
+  private sendRoomList(socket: WebSocket): void {
+    this.send(socket, { t: 'roomList', rooms: this.roomSummaries(), serverNow: Date.now() });
   }
 
   /** Log công khai từ đầu ván, không chứa seed/hand của bất kỳ ai. */
@@ -1783,7 +2121,12 @@ export class RoomManager {
     return gamePlayer.hand.map(toCardView);
   }
 
-  private publicRoom(room: Room, viewer: RoomPlayer): RoomView {
+  private spectatorCount(room: Room): number {
+    return room.spectators.filter((spectator) => spectator.connected).length;
+  }
+
+  private publicRoom(room: Room, viewer: RoomPlayer | RoomSpectator): RoomView {
+    const isPlayer = 'seat' in viewer;
     return {
       code: room.code,
       hostSeat: room.hostSeat,
@@ -1800,9 +2143,39 @@ export class RoomManager {
           connected: player.connected,
           isHost: player.seat === room.hostSeat,
         })),
+      spectatorCount: this.spectatorCount(room),
       ...(room.tourId !== null ? { tour: this.tourView(room) } : {}),
-      you: { seat: viewer.seat, token: viewer.token },
+      you: {
+        seat: isPlayer ? viewer.seat : -1,
+        token: viewer.token,
+        role: isPlayer ? 'player' : 'spectator',
+      },
     };
+  }
+
+  /** Bộ đánh ngay trước bộ đang dẫn trong cùng vòng (doc-5 §6); null ở đầu vòng. */
+  private previousTableOf(game: GameState): TableView | null {
+    const current = game.trick.lastPlay;
+    if (!current) return null;
+    let seenCurrent = false;
+    for (let index = game.history.length - 1; index >= 0; index -= 1) {
+      const entry = game.history[index];
+      if (!entry) continue;
+      if (entry.type !== 'play' && entry.type !== 'chop') continue;
+      if (entry.trickId !== game.trick.id) continue;
+      if (!seenCurrent) {
+        if (entry.actionId === current.actionId) seenCurrent = true;
+        continue;
+      }
+      return {
+        cards: entry.cards.map(toCardView),
+        seat: entry.seat,
+        actionId: entry.actionId,
+        comboKind: entry.combo.kind,
+        comboSize: entry.combo.size,
+      };
+    }
+    return null;
   }
 
   private publicState(room: Room): PublicGameState {
@@ -1828,6 +2201,7 @@ export class RoomManager {
         turnDeadline: null,
         chopWindow: null,
         lastActionId: null,
+        previousTable: null,
         ...(room.roundIndex > 0
           ? { roundIndex: room.roundIndex, firstMoveFree: false, firstSeat: -1 }
           : {}),
@@ -1897,6 +2271,7 @@ export class RoomManager {
       turnDeadline: room.turnDeadline,
       chopWindow,
       lastActionId: game.lastActionId,
+      previousTable: this.previousTableOf(game),
       roundIndex: game.roundIndex,
       firstMoveFree: game.firstMoveFree,
       firstSeat: game.startingPlayerIndex,

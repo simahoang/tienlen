@@ -11,6 +11,8 @@ export const MIN_SEATS = 2;
 export const MAX_SEATS = 4;
 export const ROOM_CODE_LENGTH = 5;
 export const NICKNAME_MAX = 20;
+/** Số khán giả tối đa mỗi phòng (doc-5 §4.1). */
+export const MAX_SPECTATORS = 10;
 
 const ROOM_CODE_PATTERN = /^[A-Z0-9]{4,6}$/;
 const CARD_ID_PATTERN = /^(3|4|5|6|7|8|9|10|J|Q|K|A|2)-(spades|clubs|diamonds|hearts)$/;
@@ -29,6 +31,8 @@ export interface RoomPlayerView {
   readonly isHost: boolean;
 }
 
+export type RoomRole = 'player' | 'spectator';
+
 export interface RoomView {
   readonly code: string;
   readonly hostSeat: number;
@@ -37,8 +41,29 @@ export interface RoomView {
   readonly players: readonly RoomPlayerView[];
   /** Thông tin tour của phòng; vắng mặt = phòng chưa mở tour (lobby cũ). */
   readonly tour?: TourView;
-  /** Chỉ có ý nghĩa với người nhận message; token dùng cho reconnect (pha 2). */
-  readonly you: { readonly seat: number; readonly token: string };
+  /** Số khán giả đang xem; vắng mặt = client cũ / phòng không có khán giả. */
+  readonly spectatorCount?: number;
+  /**
+   * Chỉ có ý nghĩa với người nhận message; token dùng cho reconnect (pha 2).
+   * Khán giả nhận `seat: -1` + `role: 'spectator'`; vắng `role` = người chơi (client cũ).
+   */
+  readonly you: { readonly seat: number; readonly token: string; readonly role?: RoomRole };
+}
+
+/** Một hàng danh sách phòng ở sảnh (doc-5 §3.1) — không chứa token/hand/tài khoản. */
+export interface RoomSummaryView {
+  readonly code: string;
+  readonly hostNickname: string;
+  readonly playerCount: number;
+  readonly maxSeats: number;
+  readonly phase: RoomPhase;
+  readonly spectatorCount: number;
+  /** Ván hiện tại/đã chơi gần nhất của tour; null khi phòng không có tour. */
+  readonly roundIndex: number | null;
+  /** Tổng số ván của tour; null khi phòng không có tour. */
+  readonly soVan: number | null;
+  /** true khi phase lobby và còn ghế trống (vào thẳng ghế được). */
+  readonly canJoin: boolean;
 }
 
 export type RoomPhase = 'lobby' | 'playing' | 'finished';
@@ -215,6 +240,11 @@ export interface PublicGameState {
   readonly turnDeadline: number | null;
   readonly chopWindow: ChopWindowView | null;
   readonly lastActionId: string | null;
+  /**
+   * Bộ đánh ngay trước bộ đang dẫn trong CÙNG vòng (doc-5 §6) để client vẽ lớp mờ;
+   * null khi đầu vòng/không có. Vắng mặt = client cũ.
+   */
+  readonly previousTable?: TableView | null;
   /** Ván thứ mấy trong tour (1..N); vắng mặt = client cũ / ván đơn. */
   readonly roundIndex?: number;
   /** true khi lượt đầu ván được đánh tự do (ván ≥ 2 của tour, doc-4 §4.2). */
@@ -227,6 +257,12 @@ export interface PublicGameState {
 export type ClientMessage =
   | { readonly t: 'createRoom'; readonly nickname: string; readonly soVan?: number }
   | { readonly t: 'joinRoom'; readonly code: string; readonly nickname: string }
+  /** Khán giả đang xem xin vào ghế trống (chỉ khi lobby, còn ghế, không tour active). */
+  | { readonly t: 'joinSeat'; readonly code: string }
+  /** Khán giả rời phòng, giữ socket để quay lại sảnh. */
+  | { readonly t: 'leaveWatch' }
+  /** Xin danh sách phòng đang mở (sảnh). */
+  | { readonly t: 'listRooms' }
   | { readonly t: 'ready'; readonly ready: boolean }
   | { readonly t: 'start' }
   | { readonly t: 'play'; readonly cards: readonly string[] }
@@ -243,6 +279,12 @@ export type ClientMessage =
 
 export type ServerMessage =
   | { readonly t: 'room'; readonly room: RoomView }
+  | {
+      /** Danh sách phòng ở sảnh; server push khi có thay đổi hoặc trả lời `listRooms`. */
+      readonly t: 'roomList';
+      readonly rooms: readonly RoomSummaryView[];
+      readonly serverNow: number;
+    }
   | {
       readonly t: 'state';
       readonly you: { readonly seat: number; readonly hand: readonly CardView[] };
@@ -356,6 +398,15 @@ export function parseClientMessage(raw: string): ParseResult {
       if (!nickname) return fail('INVALID_NICKNAME', `nickname phải 1-${NICKNAME_MAX} ký tự`);
       return { ok: true, message: { t: 'joinRoom', code, nickname } };
     }
+    case 'joinSeat': {
+      const code = parseRoomCode(parsed['code']);
+      if (!code) return fail('INVALID_CODE', 'mã phòng phải 4-6 ký tự A-Z/0-9');
+      return { ok: true, message: { t: 'joinSeat', code } };
+    }
+    case 'leaveWatch':
+      return { ok: true, message: { t: 'leaveWatch' } };
+    case 'listRooms':
+      return { ok: true, message: { t: 'listRooms' } };
     case 'ready': {
       const ready = parsed['ready'];
       if (typeof ready !== 'boolean') return fail('INVALID_PAYLOAD', 'ready phải là boolean');

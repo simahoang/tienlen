@@ -4,6 +4,7 @@ import type {
   ClientMessage,
   DenBaiView,
   PublicGameState,
+  RoomSummaryView,
   RoomView,
   ServerMessage,
   TourEndView,
@@ -40,6 +41,8 @@ export interface ClientSnapshot {
   readonly tourPaused: TourPausedView | null;
   /** Bảng tổng kết cuối tour; null = tour chưa kết thúc. */
   readonly tourEnd: TourEndView | null;
+  /** Danh sách phòng ở sảnh; null = chưa có dữ liệu (đang tải / chưa xin). */
+  readonly roomList: readonly RoomSummaryView[] | null;
 }
 
 export interface GameClientOptions {
@@ -100,6 +103,7 @@ export class GameClient {
     tourResult: null,
     tourPaused: null,
     tourEnd: null,
+    roomList: null,
   };
 
   constructor(options: GameClientOptions) {
@@ -154,6 +158,7 @@ export class GameClient {
       tourResult: null,
       tourPaused: null,
       tourEnd: null,
+      roomList: null,
     });
     this.openSocket();
   }
@@ -185,6 +190,48 @@ export class GameClient {
   joinRoom(code: string, nickname: string): boolean {
     this.clearError();
     return this.send({ t: 'joinRoom', code: code.trim().toUpperCase(), nickname: nickname.trim() });
+  }
+
+  /** Xin danh sách phòng ở sảnh; server trả `roomList` (và push khi có thay đổi). */
+  listRooms(): boolean {
+    return this.send({ t: 'listRooms' });
+  }
+
+  /** Khán giả xin vào ghế trống khi phòng còn mở (server tự kiểm tra điều kiện). */
+  joinSeat(code: string): boolean {
+    this.clearError();
+    return this.send({ t: 'joinSeat', code: code.trim().toUpperCase() });
+  }
+
+  /**
+   * Khán giả rời phòng nhưng giữ socket để quay lại sảnh: xoá phiên local rồi xin
+   * lại danh sách phòng. Không đóng socket (khác `leaveRoom`).
+   */
+  leaveWatch(): boolean {
+    this.clearError();
+    const sent = this.send({ t: 'leaveWatch' });
+    if (!sent) return false;
+    this.token = null;
+    this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
+    this.reconnectStartedAt = null;
+    this.reconnectAttempt = 0;
+    this.clearReconnectTimer();
+    this.update({
+      status: 'open',
+      room: null,
+      state: null,
+      stateReceivedAt: 0,
+      hand: [],
+      actionLog: [],
+      reconnectAttempt: 0,
+      lastDenBai: null,
+      tourResult: null,
+      tourPaused: null,
+      tourEnd: null,
+      roomList: null,
+    });
+    this.listRooms();
+    return true;
   }
 
   setReady(ready: boolean): boolean {
@@ -276,10 +323,12 @@ export class GameClient {
     this.reconnectStartedAt = null;
     if (this.token) {
       this.sendRaw(socket, { t: 'reconnect', token: this.token });
-      return;
+    } else {
+      this.reconnectAttempt = 0;
+      this.update({ status: 'open', reconnectAttempt: 0 });
     }
-    this.reconnectAttempt = 0;
-    this.update({ status: 'open', reconnectAttempt: 0 });
+    // Luôn xin danh sách phòng để sảnh có dữ liệu ngay cả sau reconnect.
+    this.sendRaw(socket, { t: 'listRooms' });
   }
 
   private handleRawMessage(data: unknown): void {
@@ -299,7 +348,8 @@ export class GameClient {
       type !== 'denBai' &&
       type !== 'tourResult' &&
       type !== 'tourPaused' &&
-      type !== 'tourEnd'
+      type !== 'tourEnd' &&
+      type !== 'roomList'
     ) {
       return;
     }
@@ -308,13 +358,33 @@ export class GameClient {
 
   private handleMessage(message: ServerMessage): void {
     switch (message.t) {
-      case 'room':
+      case 'room': {
+        const previous = this.snapshot.room;
         this.token = message.room.you.token;
         this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
         this.reconnectStartedAt = null;
         this.reconnectAttempt = 0;
+        const roomChanged = previous !== null && previous.code !== message.room.code;
+        // Khán giả bấm "Vào ghế": seat -1 -> ghế thật, danh sách sảnh đã cũ.
+        const tookSeat =
+          previous !== null &&
+          previous.code === message.room.code &&
+          previous.you.seat < 0 &&
+          message.room.you.seat >= 0;
+        if (roomChanged || tookSeat) {
+          this.update({
+            room: message.room,
+            status: 'open',
+            error: null,
+            reconnectAttempt: 0,
+            roomList: null,
+          });
+          this.listRooms();
+          return;
+        }
         this.update({ room: message.room, status: 'open', error: null, reconnectAttempt: 0 });
         return;
+      }
       case 'state':
         this.update({
           state: message.state,
@@ -330,7 +400,9 @@ export class GameClient {
           this.update({
             status: 'open',
             error: { code: message.code, message: message.message },
+            roomList: null,
           });
+          this.listRooms();
           return;
         }
         this.update({ error: { code: message.code, message: message.message } });
@@ -351,6 +423,40 @@ export class GameClient {
       case 'tourEnd':
         this.update({ tourEnd: message.summary, tourResult: null, tourPaused: null });
         return;
+      case 'roomList': {
+        const current = this.snapshot.room;
+        const spectating =
+          current !== null &&
+          (current.you.role === 'spectator' || current.you.seat === -1);
+        const stillListed =
+          current !== null && message.rooms.some((entry) => entry.code === current.code);
+        if (spectating && !stillListed) {
+          // Phòng đã giải tán: khán giả tự về sảnh, giữ socket để nhận danh sách mới.
+          this.token = null;
+          this.reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
+          this.reconnectStartedAt = null;
+          this.reconnectAttempt = 0;
+          this.clearReconnectTimer();
+          this.update({
+            status: 'open',
+            room: null,
+            state: null,
+            stateReceivedAt: 0,
+            hand: [],
+            actionLog: [],
+            error: null,
+            reconnectAttempt: 0,
+            lastDenBai: null,
+            tourResult: null,
+            tourPaused: null,
+            tourEnd: null,
+            roomList: message.rooms,
+          });
+          return;
+        }
+        this.update({ roomList: message.rooms });
+        return;
+      }
     }
   }
 
