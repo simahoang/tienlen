@@ -591,20 +591,14 @@ function chatPanel(state: TableRenderState, actions: TableActions): HTMLElement 
   }
   body.append(list);
 
-  if (view.isSpectator) {
-    const hint = text('p', 'Khán giả chỉ xem chat', 'chat-readonly');
-    hint.dataset['testid'] = 'chat-readonly';
-    body.append(hint);
-  }
-
   const compose = element('div', 'chat-compose');
   const input = element('textarea', 'chat-input');
   input.dataset['testid'] = 'chat-input';
   input.rows = 1;
   input.maxLength = CHAT_MAX;
   input.value = state.chatDraft;
-  input.placeholder = view.isSpectator ? 'Khán giả chỉ xem chat' : 'Nhập tin nhắn…';
-  input.disabled = view.isSpectator || !online;
+  input.placeholder = 'Nhập tin nhắn…';
+  input.disabled = !online;
   input.setAttribute('aria-label', 'Nội dung tin nhắn');
   input.addEventListener('input', () => {
     actions.onChatDraftChange(input.value);
@@ -618,7 +612,7 @@ function chatPanel(state: TableRenderState, actions: TableActions): HTMLElement 
   const send = text('button', 'Gửi', 'btn btn--primary btn--tiny chat-send');
   send.type = 'button';
   send.dataset['testid'] = 'chat-send';
-  send.disabled = view.isSpectator || !online || state.chatDraft.trim().length === 0;
+  send.disabled = !online || state.chatDraft.trim().length === 0;
   send.addEventListener('click', () => {
     actions.sendChat();
   });

@@ -54,6 +54,7 @@ export interface LeaderboardRowView {
 /** Một tin chat trong phòng; `role` cho client biết hiển thị badge khán giả/người chơi. */
 export interface ChatMessageView {
   readonly id: string;
+  /** Ghế người chơi; `-1` khi tin do khán giả gửi. */
   readonly seat: number;
   readonly nickname: string;
   readonly role: RoomRole;
@@ -309,7 +310,7 @@ export type ClientMessage =
   | { readonly t: 'endTour' }
   /** Tour mới cùng ghế: tour_id mới, điểm từ 0. */
   | { readonly t: 'newTour'; readonly soVan?: number }
-  /** Chat phòng: chỉ người chơi gửi được; server validate + rate limit + broadcast. */
+  /** Chat phòng: người chơi và khán giả đều gửi được; server validate + rate limit + broadcast. */
   | { readonly t: 'chat'; readonly text: string }
   | { readonly t: 'reconnect'; readonly token: string };
 

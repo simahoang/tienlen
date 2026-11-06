@@ -34,7 +34,6 @@ import { resolveTourCount, validateTourCountInput } from './ui/tour';
 import {
   buildLobbyView,
   buildTableView,
-  isSpectatorRoom,
   NICKNAME_MAX_LENGTH,
   normalizeNickname,
   normalizeRoomCode,
@@ -444,7 +443,6 @@ export class App {
     if (send === null) return;
     const snapshot = this.client.getSnapshot();
     send.disabled =
-      isSpectatorRoom(snapshot.room) ||
       snapshot.status !== 'open' ||
       this.chatDraft.trim().length === 0;
   }

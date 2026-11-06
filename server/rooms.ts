@@ -689,38 +689,52 @@ export class RoomManager {
     this.sendRoomList(socket);
   }
 
-  /** Chat phòng: chỉ người chơi gửi, rate limit theo account, broadcast cho cả phòng. */
+  /**
+   * Chat phòng: người chơi và khán giả đều gửi được; rate limit 5 tin/5s theo account,
+   * broadcast cho cả phòng, lưu history. Tin của khán giả có `seat: -1`, `role: 'spectator'`.
+   */
   private handleChat(socket: WebSocket, text: string): void {
     const binding = this.bindingOf(socket);
     if (!binding) {
       this.sendError(socket, 'NOT_IN_ROOM', 'chưa ở trong phòng');
       return;
     }
-    if (binding.role !== 'player') {
-      this.sendError(socket, 'FORBIDDEN_ROLE', 'khán giả chỉ xem chat, không gửi được');
-      return;
-    }
-    const { room, player } = binding;
-    if (player.left) {
-      this.sendError(socket, 'FORBIDDEN_ROLE', 'đã rời tour, không gửi chat được');
-      return;
+    const { room } = binding;
+    let account: string;
+    let nickname: string;
+    let seat: number;
+    let role: ChatMessageView['role'];
+    if (binding.role === 'player') {
+      if (binding.player.left) {
+        this.sendError(socket, 'FORBIDDEN_ROLE', 'đã rời tour, không gửi chat được');
+        return;
+      }
+      account = binding.player.account;
+      nickname = binding.player.nickname;
+      seat = binding.player.seat;
+      role = 'player';
+    } else {
+      account = binding.spectator.account;
+      nickname = binding.spectator.nickname;
+      seat = -1;
+      role = 'spectator';
     }
     const now = Date.now();
     const cutoff = now - CHAT_RATE_WINDOW_MS;
-    const recent = (room.chatRate.get(player.account) ?? []).filter((time) => time > cutoff);
+    const recent = (room.chatRate.get(account) ?? []).filter((time) => time > cutoff);
     if (recent.length >= CHAT_RATE_MAX) {
-      room.chatRate.set(player.account, recent);
+      room.chatRate.set(account, recent);
       this.sendError(socket, 'RATE_LIMITED', 'gửi chat quá nhanh, thử lại sau');
       return;
     }
     recent.push(now);
-    room.chatRate.set(player.account, recent);
+    room.chatRate.set(account, recent);
     room.chatSeq += 1;
     const message: ChatMessageView = {
       id: `c${room.chatSeq}`,
-      seat: player.seat,
-      nickname: player.nickname,
-      role: 'player',
+      seat,
+      nickname,
+      role,
       text,
       at: now,
     };

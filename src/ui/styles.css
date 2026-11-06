@@ -1847,8 +1847,7 @@ body.is-dragging-card {
   white-space: pre-wrap;
 }
 
-.chat-empty,
-.chat-readonly {
+.chat-empty {
   margin: 0;
   color: var(--muted);
   font-size: 0.78rem;
@@ -1905,9 +1904,19 @@ body.is-dragging-card {
     border-right: 1px solid var(--line);
   }
 
+  /* Chat la bottom sheet cao 1/2 viewport; BXH van la drawer trai full height. */
   .side-panel--chat.side-panel--open {
+    top: auto;
+    left: 0;
     right: 0;
-    border-left: 1px solid var(--line);
+    bottom: 0;
+    width: 100%;
+    height: 50dvh;
+    max-height: 50dvh;
+    padding: 12px 12px calc(env(safe-area-inset-bottom, 0px) + 12px);
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    border-radius: 16px 16px 0 0;
   }
 
   .side-panel--open .side-panel__close {
@@ -1939,6 +1948,11 @@ body.is-dragging-card {
     position: sticky;
     top: 16px;
     max-height: calc(100dvh - 32px);
+  }
+
+  /* Panel chat chi cao 1/2 chieu cao ban dau; BXH giu nguyen. */
+  .side-panel--chat {
+    max-height: calc((100dvh - 32px) / 2);
   }
 
   .side-panel__close,
